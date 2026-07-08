@@ -124,6 +124,24 @@ func (s *Store) PutReceipt(record ReceiptRecord) error {
 	return s.saveLocked()
 }
 
+func (s *Store) ReserveReceipt(record ReceiptRecord) (ReceiptRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data.Receipts == nil {
+		s.data.Receipts = make(map[string]ReceiptRecord)
+	}
+	if existing, ok := s.data.Receipts[record.ExternalID]; ok {
+		return existing, false, nil
+	}
+
+	s.data.Receipts[record.ExternalID] = record
+	if err := s.saveLocked(); err != nil {
+		delete(s.data.Receipts, record.ExternalID)
+		return ReceiptRecord{}, false, err
+	}
+	return record, true, nil
+}
+
 func (s *Store) saveLocked() error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return fmt.Errorf("create state directory: %w", err)
@@ -159,6 +177,9 @@ func (s *Store) saveLocked() error {
 	}
 	if err := os.Rename(tmpName, s.path); err != nil {
 		return fmt.Errorf("replace state file: %w", err)
+	}
+	if err := syncParentDir(s.path); err != nil {
+		return fmt.Errorf("sync state directory: %w", err)
 	}
 	return os.Chmod(s.path, 0o600)
 }

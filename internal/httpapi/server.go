@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -17,10 +18,16 @@ import (
 
 var moneyPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)(\.[0-9]{1,2})?$`)
 
+type lknpdClient interface {
+	GetUser(ctx context.Context) (lknpd.UserInfo, error)
+	CreateIncome(ctx context.Context, params lknpd.CreateIncomeParams) (lknpd.Receipt, error)
+	CancelIncome(ctx context.Context, receiptUUID, comment string, operationTime time.Time) error
+}
+
 type Server struct {
 	apiKey             string
 	defaultServiceName string
-	client             *lknpd.Client
+	client             lknpdClient
 	store              *state.Store
 	logger             *slog.Logger
 	mux                *http.ServeMux
@@ -38,7 +45,7 @@ type cancelReceiptRequest struct {
 	OperationTime string `json:"operation_time,omitempty"`
 }
 
-func New(apiKey, defaultServiceName string, client *lknpd.Client, store *state.Store, logger *slog.Logger) *Server {
+func New(apiKey, defaultServiceName string, client lknpdClient, store *state.Store, logger *slog.Logger) *Server {
 	s := &Server{
 		apiKey:             apiKey,
 		defaultServiceName: defaultServiceName,
@@ -111,15 +118,6 @@ func (s *Server) createReceipt(w http.ResponseWriter, r *http.Request) {
 		operationTime = time.Now()
 	}
 
-	if existing, ok := s.store.GetReceipt(request.ExternalID); ok {
-		status := http.StatusConflict
-		if existing.Status == "created" || existing.Status == "cancelled" {
-			status = http.StatusOK
-		}
-		writeJSON(w, status, existing)
-		return
-	}
-
 	now := time.Now().UTC()
 	record := state.ReceiptRecord{
 		ExternalID:    request.ExternalID,
@@ -130,10 +128,20 @@ func (s *Server) createReceipt(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
-	if err := s.store.PutReceipt(record); err != nil {
+	existing, created, err := s.store.ReserveReceipt(record)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to persist receipt request")
 		return
 	}
+	if !created {
+		status := http.StatusConflict
+		if existing.Status == "created" || existing.Status == "cancelled" {
+			status = http.StatusOK
+		}
+		writeJSON(w, status, existing)
+		return
+	}
+	record = existing
 
 	receipt, err := s.client.CreateIncome(r.Context(), lknpd.CreateIncomeParams{
 		Amount:        request.Amount,
