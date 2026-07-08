@@ -3,11 +3,15 @@ use v5.14;
 use strict;
 use warnings;
 
+use FindBin qw($Bin);
+use lib "$Bin/lib";
+
 use Core::Base;
 use Core::Utils qw(parse_headers encode_json decode_json now);
 use LWP::UserAgent ();
 use HTTP::Request ();
 use SHM qw(:all);
+use VFFFiscal::PaymentTimestamp qw(extract_operation_time);
 
 our %ARGS = parse_args();
 my $shm = SHM->new(skip_check_auth => 1);
@@ -65,7 +69,7 @@ sub send_receipt {
     }
 
     my %payment = $pay->get;
-    if ($payment{comment} && $payment{comment}{income_send}) {
+    if (ref($payment{comment}) eq 'HASH' && $payment{comment}{income_send}) {
         return {
             status => 200,
             msg => 'Receipt already sent',
@@ -79,22 +83,36 @@ sub send_receipt {
     }
 
     my $amount;
-    if ($payment{comment}
-        && $payment{comment}{object}
-        && $payment{comment}{object}{amount}
-        && $payment{comment}{object}{amount}{value}) {
-        $amount = $payment{comment}{object}{amount}{value};
-    } else {
+    if (ref($payment{comment}) eq 'HASH') {
+        my $object = $payment{comment}{object};
+        if (ref($object) eq 'HASH') {
+            my $amount_obj = $object->{amount};
+            if (ref($amount_obj) eq 'HASH' && defined $amount_obj->{value} && length $amount_obj->{value}) {
+                $amount = $amount_obj->{value};
+            }
+        }
+    }
+    unless (defined $amount) {
         $amount = $payment{money};
     }
     unless ($amount && $amount > 0) {
         return { status => 400, msg => 'Error: payment amount is zero or negative' };
     }
 
+    my $object =
+        ref($payment{comment}) eq 'HASH'
+            ? $payment{comment}{object}
+            : undef;
+    my ($operation_time, $timestamp_error) = extract_operation_time($object);
+    if ($timestamp_error) {
+        return $timestamp_error;
+    }
+
     my $payload = {
         external_id => "shm:$pay_id",
         amount => sprintf('%.2f', $amount),
         service_name => $service_name,
+        operation_time => $operation_time,
     };
 
     my $request = HTTP::Request->new(POST => $backend_url);

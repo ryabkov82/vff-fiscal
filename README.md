@@ -129,6 +129,39 @@ The existing SHM settings form can still control:
 
 The fake Customlab refresh token is not used by the replacement adapter and should be removed from SHM configuration.
 
+### Payment timestamp
+
+The authoritative fiscalization timestamp is `comment.object.captured_at` from the YooKassa payment object stored in SHM. The adapter passes `captured_at` unchanged as `operation_time` in the `POST /v1/receipts` payload. `created_at`, SHM record creation time, and adapter execution time are not used.
+
+vff-fiscal converts the RFC3339 instant to `LKNPD_TIMEZONE_OFFSET` before sending it to FNS.
+
+Both files must be deployed together:
+
+- `srv_customlab_nalog.cgi`
+- `lib/VFFFiscal/PaymentTimestamp.pm`
+
+Do not replace the production adapter until staging checks pass. Validate a staged copy under `/tmp` inside the SHM container before installation:
+
+```bash
+docker exec shm-core-1 mkdir -p /tmp/vff-fiscal-adapter/lib/VFFFiscal
+
+docker cp adapters/shm/srv_customlab_nalog.cgi \
+  shm-core-1:/tmp/vff-fiscal-adapter/srv_customlab_nalog.cgi
+
+docker cp adapters/shm/lib/VFFFiscal/PaymentTimestamp.pm \
+  shm-core-1:/tmp/vff-fiscal-adapter/lib/VFFFiscal/PaymentTimestamp.pm
+
+docker exec shm-core-1 \
+  perl -c /tmp/vff-fiscal-adapter/srv_customlab_nalog.cgi
+```
+
+When ready for production, copy both the CGI and `lib/` directory next to it:
+
+```bash
+install -d -o www-data -g www-data -m 0755 /opt/shm/pay_systems/lib
+cp -a adapters/shm/lib/* /opt/shm/pay_systems/lib/
+```
+
 ### Important update risk
 
 SHM Cloud may overwrite `srv_customlab_nalog.cgi`. Keep its expected SHA-256 under monitoring or manage the file through deployment automation after SHM updates.
