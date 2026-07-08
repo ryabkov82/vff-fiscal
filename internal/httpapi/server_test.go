@@ -65,10 +65,14 @@ func newTestServer(t *testing.T, client lknpdClient) (*httptest.Server, *state.S
 }
 
 func postReceiptRequest(externalID string, auth bool) (*http.Request, error) {
-	body, err := json.Marshal(map[string]string{
+	return postReceiptPayloadRequest(map[string]string{
 		"external_id": externalID,
 		"amount":      "10.00",
-	})
+	}, auth)
+}
+
+func postReceiptPayloadRequest(payload map[string]string, auth bool) (*http.Request, error) {
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -82,6 +86,35 @@ func postReceiptRequest(externalID string, auth bool) (*http.Request, error) {
 		request.Header.Set("Authorization", "Bearer test-api-key")
 	}
 	return request, nil
+}
+
+func postReceiptPayload(t *testing.T, server *httptest.Server, payload map[string]string) *http.Response {
+	t.Helper()
+
+	request, err := postReceiptPayloadRequest(payload, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.URL.Scheme = "http"
+	request.URL.Host = server.Listener.Addr().String()
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response
+}
+
+func decodeErrorMessage(t *testing.T, response *http.Response) string {
+	t.Helper()
+	defer response.Body.Close()
+
+	var body map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	message, _ := body["error"].(string)
+	return message
 }
 
 func postReceipt(t *testing.T, server *httptest.Server, externalID string, auth bool) *http.Response {
@@ -280,5 +313,150 @@ func TestGetReceiptNotFound(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", response.StatusCode)
+	}
+}
+
+func TestCreateReceiptDuplicateDifferentAmount(t *testing.T) {
+	fake := &fakeLKNPD{}
+	server, _ := newTestServer(t, fake)
+	defer server.Close()
+
+	first := postReceiptPayload(t, server, map[string]string{
+		"external_id": "dup-amount:1",
+		"amount":      "10.00",
+	})
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", first.StatusCode)
+	}
+	first.Body.Close()
+
+	second := postReceiptPayload(t, server, map[string]string{
+		"external_id": "dup-amount:1",
+		"amount":      "11.00",
+	})
+	if second.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", second.StatusCode)
+	}
+	if got := decodeErrorMessage(t, second); got != "external_id already exists with different receipt data" {
+		t.Fatalf("unexpected error: %q", got)
+	}
+	if fake.createIncomeCalls.Load() != 1 {
+		t.Fatalf("expected one CreateIncome call, got %d", fake.createIncomeCalls.Load())
+	}
+}
+
+func TestCreateReceiptDuplicateDifferentServiceName(t *testing.T) {
+	fake := &fakeLKNPD{}
+	server, _ := newTestServer(t, fake)
+	defer server.Close()
+
+	first := postReceiptPayload(t, server, map[string]string{
+		"external_id":  "dup-service:1",
+		"amount":       "10.00",
+		"service_name": "Test service",
+	})
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", first.StatusCode)
+	}
+	first.Body.Close()
+
+	second := postReceiptPayload(t, server, map[string]string{
+		"external_id":  "dup-service:1",
+		"amount":       "10.00",
+		"service_name": "Other service",
+	})
+	if second.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", second.StatusCode)
+	}
+	if got := decodeErrorMessage(t, second); got != "external_id already exists with different receipt data" {
+		t.Fatalf("unexpected error: %q", got)
+	}
+	if fake.createIncomeCalls.Load() != 1 {
+		t.Fatalf("expected one CreateIncome call, got %d", fake.createIncomeCalls.Load())
+	}
+}
+
+func TestCreateReceiptDuplicateDifferentOperationTime(t *testing.T) {
+	fake := &fakeLKNPD{}
+	server, _ := newTestServer(t, fake)
+	defer server.Close()
+
+	first := postReceiptPayload(t, server, map[string]string{
+		"external_id":    "dup-time:1",
+		"amount":         "10.00",
+		"operation_time": "2026-07-09T16:30:00+03:00",
+	})
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", first.StatusCode)
+	}
+	first.Body.Close()
+
+	second := postReceiptPayload(t, server, map[string]string{
+		"external_id":    "dup-time:1",
+		"amount":         "10.00",
+		"operation_time": "2026-07-09T17:30:00+03:00",
+	})
+	if second.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", second.StatusCode)
+	}
+	if got := decodeErrorMessage(t, second); got != "external_id already exists with different receipt data" {
+		t.Fatalf("unexpected error: %q", got)
+	}
+	if fake.createIncomeCalls.Load() != 1 {
+		t.Fatalf("expected one CreateIncome call, got %d", fake.createIncomeCalls.Load())
+	}
+}
+
+func TestCreateReceiptDuplicateOmittedServiceNameMatchesDefault(t *testing.T) {
+	fake := &fakeLKNPD{}
+	server, _ := newTestServer(t, fake)
+	defer server.Close()
+
+	first := postReceiptPayload(t, server, map[string]string{
+		"external_id": "dup-default-service:1",
+		"amount":      "10.00",
+	})
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", first.StatusCode)
+	}
+	first.Body.Close()
+
+	second := postReceiptPayload(t, server, map[string]string{
+		"external_id": "dup-default-service:1",
+		"amount":      "10.00",
+	})
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", second.StatusCode)
+	}
+	second.Body.Close()
+	if fake.createIncomeCalls.Load() != 1 {
+		t.Fatalf("expected one CreateIncome call, got %d", fake.createIncomeCalls.Load())
+	}
+}
+
+func TestCreateReceiptDuplicateEquivalentAmountFormats(t *testing.T) {
+	fake := &fakeLKNPD{}
+	server, _ := newTestServer(t, fake)
+	defer server.Close()
+
+	first := postReceiptPayload(t, server, map[string]string{
+		"external_id": "dup-amount-format:1",
+		"amount":      "150.00",
+	})
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", first.StatusCode)
+	}
+	first.Body.Close()
+
+	second := postReceiptPayload(t, server, map[string]string{
+		"external_id": "dup-amount-format:1",
+		"amount":      "150",
+	})
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", second.StatusCode)
+	}
+	second.Body.Close()
+	if fake.createIncomeCalls.Load() != 1 {
+		t.Fatalf("expected one CreateIncome call, got %d", fake.createIncomeCalls.Load())
 	}
 }

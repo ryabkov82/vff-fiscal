@@ -134,6 +134,11 @@ func (s *Server) createReceipt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !created {
+		operationTimeExplicit := strings.TrimSpace(request.OperationTime) != ""
+		if !receiptPayloadMatches(existing, request.Amount, request.ServiceName, operationTime, operationTimeExplicit) {
+			writeError(w, http.StatusConflict, "external_id already exists with different receipt data")
+			return
+		}
 		status := http.StatusConflict
 		if existing.Status == "created" || existing.Status == "cancelled" {
 			status = http.StatusOK
