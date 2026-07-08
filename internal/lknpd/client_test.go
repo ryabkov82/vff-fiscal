@@ -36,7 +36,7 @@ func TestCreateIncomeRefreshesTokenAndPersistsRotation(t *testing.T) {
 		}
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		if body["paymentType"] != "ACCOUNT" {
+		if body["paymentType"] != "WIRE" {
 			t.Fatalf("unexpected payment type: %#v", body["paymentType"])
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"approvedReceiptUuid": "receipt-1"})
@@ -55,7 +55,7 @@ func TestCreateIncomeRefreshesTokenAndPersistsRotation(t *testing.T) {
 		BaseURL:        server.URL,
 		UserAgent:      "test-agent",
 		TimezoneOffset: "+03:00",
-		PaymentType:    "ACCOUNT",
+		PaymentType:    "WIRE",
 		Timeout:        2 * time.Second,
 	}, store)
 

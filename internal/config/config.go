@@ -35,7 +35,7 @@ func Load() (Config, error) {
 		UserAgent:           env("LKNPD_USER_AGENT", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"),
 		TimezoneOffset:      env("LKNPD_TIMEZONE_OFFSET", "+03:00"),
 		DefaultServiceName:  env("VFF_FISCAL_SERVICE_NAME", "Услуга доступа к VPN-сервису VPN for Friends"),
-		PaymentType:         strings.ToUpper(env("LKNPD_PAYMENT_TYPE", "ACCOUNT")),
+		PaymentType:         strings.ToUpper(env("LKNPD_PAYMENT_TYPE", "WIRE")),
 	}
 
 	timeoutSeconds, err := strconv.Atoi(env("LKNPD_HTTP_TIMEOUT_SECONDS", "30"))
@@ -47,8 +47,8 @@ func Load() (Config, error) {
 	if cfg.APIKey == "" {
 		return Config{}, errors.New("VFF_FISCAL_API_KEY is required")
 	}
-	if cfg.PaymentType != "ACCOUNT" && cfg.PaymentType != "CASH" {
-		return Config{}, errors.New("LKNPD_PAYMENT_TYPE must be ACCOUNT or CASH")
+	if cfg.PaymentType != "WIRE" && cfg.PaymentType != "CASH" {
+		return Config{}, errors.New("LKNPD_PAYMENT_TYPE must be WIRE or CASH")
 	}
 	if !validOffset(cfg.TimezoneOffset) {
 		return Config{}, errors.New("LKNPD_TIMEZONE_OFFSET must look like +03:00")
