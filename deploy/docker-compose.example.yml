@@ -1,0 +1,27 @@
+services:
+  vff-fiscal:
+    build:
+      context: ..
+    container_name: vff-fiscal
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    volumes:
+      - ../data:/var/lib/vff-fiscal
+    networks:
+      - shm
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Only for local diagnostics. SHM reaches the service through the Docker network.
+    ports:
+      - "127.0.0.1:18080:8080"
+
+networks:
+  shm:
+    external: true
+    name: shm_default
