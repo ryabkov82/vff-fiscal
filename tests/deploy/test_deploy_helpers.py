@@ -106,6 +106,53 @@ def backup_compose_validation_violations() -> list[str]:
     return violations
 
 
+def docker_health_is_ready(rc: int, stdout: str) -> bool:
+    return rc == 0 and stdout == "true healthy"
+
+
+def simulate_docker_health_until(
+    readings: list[tuple[int, str]],
+    *,
+    retries: int,
+) -> tuple[bool, int]:
+    for attempt in range(retries + 1):
+        rc, stdout = readings[min(attempt, len(readings) - 1)]
+        if docker_health_is_ready(rc, stdout):
+            return True, attempt + 1
+    return False, retries + 1
+
+
+def unsafe_docker_health_assertions() -> list[str]:
+    violations: list[str] = []
+    for path in sorted((ROOT / "ansible").rglob("*.yml")):
+        try:
+            parsed = yaml.safe_load(path.read_text())
+        except yaml.YAMLError:
+            continue
+        if parsed is None:
+            continue
+        for task in iter_ansible_task_dicts(parsed):
+            command = task.get("ansible.builtin.command")
+            shell = task.get("ansible.builtin.shell")
+            body = ""
+            if isinstance(command, str):
+                body = command
+            elif isinstance(command, dict):
+                body = " ".join(str(part) for part in command.get("argv", []))
+            elif isinstance(shell, str):
+                body = shell
+            if "Health.Status" not in body and "true healthy" not in str(task.get("failed_when", "")):
+                continue
+            if task.get("until"):
+                continue
+            if task.get("failed_when") is False:
+                continue
+            failed_when = str(task.get("failed_when", ""))
+            if "healthy" in failed_when or "Health.Status" in body:
+                violations.append(f"{path.relative_to(ROOT)}:{task.get('name', '<unnamed>')}")
+    return violations
+
+
 def iter_ansible_task_dicts(node):
     if isinstance(node, list):
         for item in node:
@@ -765,6 +812,106 @@ class ComposeBackupProjectDirectoryTests(unittest.TestCase):
                 command = task["ansible.builtin.command"]
                 return command["argv"]
         raise AssertionError("rollback candidate validation task not found")
+
+
+class DockerHealthReadinessTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.service = (SERVICE / "tasks/main.yml").read_text()
+        cls.group_vars = yaml.safe_load((ROOT / "ansible/group_vars/all.yml").read_text())
+        cls.compose_template = (
+            SERVICE / "templates/docker-compose.yml.j2"
+        ).read_text()
+        parsed = yaml.safe_load(cls.service)
+        cls.health_task = None
+        for task in iter_ansible_task_dicts(parsed):
+            if task.get("name") == "Wait for container Docker health to become healthy":
+                cls.health_task = task
+                break
+        if cls.health_task is None:
+            raise AssertionError("docker health polling task not found")
+
+    def test_true_starting_is_transient_and_retried(self) -> None:
+        self.assertFalse(docker_health_is_ready(0, "true starting"))
+        ready, attempts = simulate_docker_health_until(
+            [(0, "true starting"), (0, "true starting"), (0, "true healthy")],
+            retries=5,
+        )
+        self.assertTrue(ready)
+        self.assertEqual(attempts, 3)
+
+    def test_true_healthy_succeeds(self) -> None:
+        ready, attempts = simulate_docker_health_until([(0, "true healthy")], retries=3)
+        self.assertTrue(ready)
+        self.assertEqual(attempts, 1)
+
+    def test_persistent_starting_fails_after_bounded_retries(self) -> None:
+        retries = int(self.group_vars["vff_fiscal_docker_health_poll_retries"])
+        ready, attempts = simulate_docker_health_until(
+            [(0, "true starting")],
+            retries=retries,
+        )
+        self.assertFalse(ready)
+        self.assertEqual(attempts, retries + 1)
+
+    def test_unhealthy_or_missing_container_cannot_succeed(self) -> None:
+        for rc, stdout in (
+            (0, "true unhealthy"),
+            (0, "false healthy"),
+            (0, "true"),
+            (1, "true healthy"),
+        ):
+            self.assertFalse(docker_health_is_ready(rc, stdout))
+            ready, _ = simulate_docker_health_until([(rc, stdout)], retries=2)
+            self.assertFalse(ready)
+
+    def test_poll_timeout_covers_compose_start_period(self) -> None:
+        start_period = int(self.group_vars["vff_fiscal_compose_health_start_period"])
+        interval = int(self.group_vars["vff_fiscal_compose_health_interval"])
+        retries = int(self.group_vars["vff_fiscal_compose_health_retries"])
+        poll_retries = int(self.group_vars["vff_fiscal_docker_health_poll_retries"])
+        poll_delay = int(self.group_vars["vff_fiscal_docker_health_poll_delay"])
+        compose_budget = start_period + interval * retries
+        poll_budget = poll_retries * poll_delay
+        self.assertGreaterEqual(poll_budget, compose_budget)
+        self.assertIn("start_period: 20s", self.compose_template)
+
+    def test_health_task_uses_until_retries_and_delay(self) -> None:
+        until = self.health_task["until"]
+        self.assertIn("service_container_health.rc == 0", until)
+        self.assertIn("service_container_health.stdout == 'true healthy'", until)
+        self.assertNotIn("failed_when", self.health_task)
+        self.assertEqual(
+            str(self.health_task["retries"]),
+            "{{ vff_fiscal_docker_health_poll_retries }}",
+        )
+        self.assertEqual(
+            str(self.health_task["delay"]),
+            "{{ vff_fiscal_docker_health_poll_delay }}",
+        )
+
+    def test_docker_health_polling_ordering(self) -> None:
+        start_idx = self.service.index("Start updated vff-fiscal service")
+        http_idx = self.service.index("Wait for health endpoint")
+        docker_idx = self.service.index("Wait for container Docker health to become healthy")
+        auth_idx = self.service.index("Authenticated user smoke test")
+        manifest_idx = self.service.index("Write successful service deploy manifest")
+        unpause_idx = self.service.index("Unpause SHM spool after service deployment")
+        self.assertLess(start_idx, http_idx)
+        self.assertLess(http_idx, docker_idx)
+        self.assertLess(docker_idx, auth_idx)
+        self.assertLess(auth_idx, manifest_idx)
+        self.assertLess(manifest_idx, unpause_idx)
+
+    def test_failure_still_enters_rescue_rollback_path(self) -> None:
+        cutover = self.service.split("- name: Service cutover block", 1)[1]
+        rescue = cutover.split("  rescue:", 1)[1].split("  always:", 1)[0]
+        self.assertIn("Restore previous compose file after failure", rescue)
+        self.assertIn("Start previous service image after failure", rescue)
+        self.assertIn("Fail play after automatic service rollback", rescue)
+
+    def test_no_unsafe_one_shot_docker_health_assertions(self) -> None:
+        self.assertEqual(unsafe_docker_health_assertions(), [])
 
 
 class HelperSafetyTests(unittest.TestCase):

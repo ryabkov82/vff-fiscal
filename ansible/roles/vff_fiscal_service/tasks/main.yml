@@ -542,13 +542,17 @@
       retries: 18
       delay: 5
 
-    - name: Assert container is running and healthy
+    - name: Wait for container Docker health to become healthy
       ansible.builtin.command: >-
         docker inspect -f '{{ "{{" }}.State.Running{{ "}}" }} {{ "{{" }}.State.Health.Status{{ "}}" }}'
         {{ vff_fiscal_container_name }}
       register: service_container_health
       changed_when: false
-      failed_when: service_container_health.stdout != 'true healthy'
+      until: >-
+        service_container_health.rc == 0
+        and service_container_health.stdout == 'true healthy'
+      retries: "{{ vff_fiscal_docker_health_poll_retries }}"
+      delay: "{{ vff_fiscal_docker_health_poll_delay }}"
 
     - name: Authenticated user smoke test
       ansible.builtin.command:
