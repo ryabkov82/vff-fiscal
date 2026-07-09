@@ -9,7 +9,15 @@
     service_previous_image: ""
     service_previous_image_id: ""
     service_previous_compose_existed: false
-    vff_fiscal_spool_was_paused: false
+    service_cutover_started: false
+    service_backup_completed: false
+    service_compose_replaced: false
+    service_new_container_started: false
+    service_rollback_validated: false
+    vff_fiscal_spool_gate_passed: false
+    vff_fiscal_spool_paused_by_operation: false
+    vff_fiscal_spool_was_already_paused: false
+    vff_fiscal_spool_leave_paused: false
 
 - name: Install service deployment helper scripts
   ansible.builtin.copy:
@@ -117,6 +125,21 @@
   ansible.builtin.set_fact:
     service_previous_image: "{{ service_current_image_tag.stdout }}"
     service_previous_image_id: "{{ service_current_image_id.stdout }}"
+  when:
+    - not ansible_check_mode | bool
+    - service_had_running_container | bool
+
+- name: Require immutable previous service image tag
+  ansible.builtin.assert:
+    that:
+      - >-
+        service_previous_image is match(
+          '^' ~ (vff_fiscal_image_repository | regex_escape)
+          ~ ':(?:[0-9a-f]{12}|[0-9a-f]{40})$'
+        )
+    fail_msg: >-
+      Existing production service does not use a proven immutable commit tag;
+      refusing a cutover that could not be rolled back safely.
   when:
     - not ansible_check_mode | bool
     - service_had_running_container | bool
@@ -233,6 +256,12 @@
       }}
   when: not ansible_check_mode | bool
 
+- name: Load existing deploy manifest before service transaction
+  ansible.builtin.include_role:
+    name: vff_fiscal_common
+    tasks_from: load_deploy_state.yml
+  when: not ansible_check_mode | bool
+
 - name: Report idempotent service deployment skip
   ansible.builtin.debug:
     msg: >-
@@ -247,6 +276,10 @@
     - not ansible_check_mode | bool
     - service_cutover_required | bool
   block:
+    - name: Mark service cutover transaction started
+      ansible.builtin.set_fact:
+        service_cutover_started: true
+
     - name: Acquire SHM spool cutover gate before service cutover
       ansible.builtin.include_role:
         name: vff_fiscal_common
@@ -279,6 +312,14 @@
       ansible.builtin.stat:
         path: "{{ vff_fiscal_compose_path }}"
       register: service_compose_stat
+
+    - name: Require recoverable Compose for existing service
+      ansible.builtin.assert:
+        that:
+          - not service_had_running_container | bool or service_compose_stat.stat.exists
+        fail_msg: >-
+          Existing service container has no production Compose file; refusing
+          cutover because automatic restoration cannot be proven.
 
     - name: Back up existing compose file
       ansible.builtin.copy:
@@ -314,9 +355,14 @@
       ansible.builtin.set_fact:
         service_backup_metadata:
           component: service
-          commit: "{{ vff_fiscal_version }}"
-          image: "{{ service_target_image }}"
-          rollback_image: "{{ service_previous_image }}"
+          target_commit: "{{ vff_fiscal_version }}"
+          target_image: "{{ service_target_image }}"
+          previous_commit: >-
+            {{ vff_fiscal_existing_deploy_state.service_commit
+            | default('unknown-pre-manifest', true) }}
+          previous_image: "{{ service_previous_image }}"
+          previous_image_id: "{{ service_previous_image_id }}"
+          previous_compose_present: "{{ service_previous_compose_existed | bool }}"
           backup_directory: "{{ service_backup_dir }}"
           deployed_at: "{{ ansible_date_time.iso8601 }}"
 
@@ -328,15 +374,27 @@
         mode: "0600"
         content: "{{ service_backup_metadata | to_nice_json }}"
 
+    - name: Mark service backup completed
+      ansible.builtin.set_fact:
+        service_backup_completed: true
+
     - name: Atomically replace compose file
       ansible.builtin.command: mv {{ vff_fiscal_compose_path }}.new {{ vff_fiscal_compose_path }}
       changed_when: true
+
+    - name: Mark production Compose replaced
+      ansible.builtin.set_fact:
+        service_compose_replaced: true
 
     - name: Start updated vff-fiscal service
       ansible.builtin.command: >-
         docker compose -f {{ vff_fiscal_compose_path }}
         up -d --no-deps --pull never {{ vff_fiscal_container_name }}
       changed_when: true
+
+    - name: Mark target service container started
+      ansible.builtin.set_fact:
+        service_new_container_started: true
 
     - name: Wait for health endpoint
       ansible.builtin.uri:
@@ -373,7 +431,49 @@
         msg: authenticated_user_check=ok
       when: service_auth_smoke.rc == 0
 
+    - name: Read SHM adapter safe status for service manifest
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+          - status
+      environment:
+        SHM_CONTAINER: "{{ shm_core_container }}"
+        DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+        SHM_SCRIPT: shm-config.pl
+      register: service_adapter_status_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Prepare successful service deploy manifest
+      ansible.builtin.set_fact:
+        vff_fiscal_common_manifest:
+          service_commit: "{{ vff_fiscal_version }}"
+          service_image: "{{ service_target_image }}"
+          service_image_id: "{{ service_target_image_id.stdout }}"
+          deployed_at: "{{ ansible_date_time.iso8601 }}"
+          backup_directory: "{{ service_backup_dir }}"
+          previous_service_image: "{{ service_previous_image }}"
+          previous_service_image_id: "{{ service_previous_image_id }}"
+          adapter_commit: "{{ vff_fiscal_existing_deploy_state.adapter_commit | default('') }}"
+          adapter_sha256: "{{ vff_fiscal_existing_deploy_state.adapter_sha256 | default('') }}"
+          adapter_enabled: "{{ vff_fiscal_existing_deploy_state.adapter_enabled | default(false) | bool }}"
+          need_update_to_present: >-
+            {{ vff_fiscal_existing_deploy_state.need_update_to_present | default(false) | bool }}
+          deployment_status: success
+
+    - name: Write successful service deploy manifest
+      ansible.builtin.include_role:
+        name: vff_fiscal_common
+        tasks_from: write_deploy_state.yml
+
   rescue:
+    - name: Remove only candidate Compose when production Compose was not replaced
+      ansible.builtin.file:
+        path: "{{ vff_fiscal_compose_path }}.new"
+        state: absent
+      when: not service_compose_replaced | default(false) | bool
+
     - name: Restore previous compose file after failure
       ansible.builtin.copy:
         src: "{{ service_backup_dir }}/docker-compose.yml"
@@ -382,13 +482,17 @@
         owner: root
         group: root
         mode: "0600"
-      when: service_previous_compose_existed | default(false) | bool
+      when:
+        - service_compose_replaced | default(false) | bool
+        - service_previous_compose_existed | default(false) | bool
 
     - name: Start previous service image after failure
       ansible.builtin.command: >-
         docker compose -f {{ vff_fiscal_compose_path }}
         up -d --no-deps --pull never {{ vff_fiscal_container_name }}
-      when: service_previous_compose_existed | default(false) | bool
+      when:
+        - service_compose_replaced | default(false) | bool
+        - service_previous_compose_existed | default(false) | bool
       changed_when: true
 
     - name: Wait for rollback health endpoint
@@ -399,19 +503,59 @@
       until: service_rollback_health.status == 200 and (service_rollback_health.json.status | default('')) == 'ok'
       retries: 12
       delay: 5
-      when: service_previous_compose_existed | default(false) | bool
+      when:
+        - service_compose_replaced | default(false) | bool
+        - service_previous_compose_existed | default(false) | bool
+
+    - name: Authenticate restored service after failed deployment
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/auth-smoke.py"
+      environment:
+        ENV_FILE: "{{ vff_fiscal_env_file }}"
+        USER_URL: http://127.0.0.1:{{ vff_fiscal_host_port }}/v1/user
+      changed_when: false
+      no_log: true
+      when:
+        - service_compose_replaced | default(false) | bool
+        - service_previous_compose_existed | default(false) | bool
+
+    - name: Mark restored service rollback validated
+      ansible.builtin.set_fact:
+        service_rollback_validated: true
+      when:
+        - service_compose_replaced | default(false) | bool
+        - service_previous_compose_existed | default(false) | bool
 
     - name: Remove failed new container when no previous service existed
-      ansible.builtin.command: docker rm -f {{ vff_fiscal_container_name }}
+      ansible.builtin.command:
+        argv:
+          - docker
+          - rm
+          - -f
+          - "{{ vff_fiscal_container_name }}"
       changed_when: true
-      failed_when: false
-      when: not service_previous_compose_existed | default(false) | bool
+      when:
+        - service_compose_replaced | default(false) | bool
+        - service_new_container_started | default(false) | bool
+        - not service_previous_compose_existed | default(false) | bool
+        - not service_had_running_container | default(false) | bool
 
     - name: Fail play after automatic service rollback
       ansible.builtin.fail:
         msg: >-
-          Service deployment failed and was rolled back to the previous compose/image when available.
-          state.json was intentionally not restored. Inspect backup at {{ service_backup_dir }}.
+          Service deployment failed.
+          {{
+            'The previous service was restored and validated.'
+            if service_rollback_validated | default(false) | bool
+            else (
+              'The newly started service was removed; no previous service was available.'
+              if service_new_container_started | default(false) | bool
+              else 'The failure occurred before production Compose replacement; the existing service was not modified.'
+            )
+          }}
+          state.json was intentionally not restored.
 
   always:
     - name: Unpause SHM spool after service deployment
@@ -426,12 +570,6 @@
   when:
     - not ansible_check_mode | bool
     - not service_cutover_required | bool
-
-- name: Load existing deploy manifest
-  ansible.builtin.include_role:
-    name: vff_fiscal_common
-    tasks_from: load_deploy_state.yml
-  when: not ansible_check_mode | bool
 
 - name: Read SHM adapter safe status for manifest via stdin helper
   ansible.builtin.command:
@@ -489,11 +627,13 @@
       deployment_status: success
   when: not ansible_check_mode | bool
 
-- name: Update deploy state after successful service deployment
+- name: Update deploy state after idempotent service verification
   ansible.builtin.include_role:
     name: vff_fiscal_common
     tasks_from: write_deploy_state.yml
-  when: not ansible_check_mode | bool
+  when:
+    - not ansible_check_mode | bool
+    - not service_cutover_required | default(true) | bool
 
 - name: Remove stale candidate compose file after check mode skip
   ansible.builtin.file:

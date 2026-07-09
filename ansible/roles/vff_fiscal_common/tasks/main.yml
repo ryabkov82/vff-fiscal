@@ -15,14 +15,17 @@
   when: ansible_check_mode | bool
 
 - name: Check required host commands
-  ansible.builtin.command: command -v {{ item }}
+  ansible.builtin.script: host_preflight.py
   changed_when: false
-  loop:
-    - git
-    - docker
-    - python3
-    - chattr
-    - lsattr
+
+- name: Check Docker daemon availability
+  ansible.builtin.command:
+    argv:
+      - docker
+      - info
+      - --format
+      - "{{ '{{' }}.ServerVersion{{ '}}' }}"
+  changed_when: false
 
 - name: Check docker compose availability
   ansible.builtin.command: docker compose version
@@ -32,14 +35,37 @@
   ansible.builtin.command: docker network inspect {{ vff_fiscal_docker_network }}
   changed_when: false
 
-- name: Check SHM containers are running
-  ansible.builtin.command: docker inspect -f '{{ "{{" }}.State.Running{{ "}}" }}' {{ item }}
+- name: Check SHM container running state
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - -f
+      - "{{ '{{' }}.State.Running{{ '}}' }}"
+      - "{{ item }}"
   changed_when: false
   loop:
     - "{{ shm_core_container }}"
     - "{{ shm_spool_container }}"
   register: shm_container_running
   failed_when: shm_container_running.stdout != 'true'
+
+- name: Collect SHM container paused state separately
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - -f
+      - "{{ '{{' }}.State.Paused{{ '}}' }}"
+      - "{{ item }}"
+  changed_when: false
+  loop:
+    - "{{ shm_core_container }}"
+    - "{{ shm_spool_container }}"
+  register: shm_container_paused
+  failed_when:
+    - shm_container_paused.stdout != 'true'
+    - shm_container_paused.stdout != 'false'
 
 - name: Generate deployment timestamp fact
   ansible.builtin.set_fact:
@@ -68,13 +94,14 @@
     group: root
   loop:
     - validate_sha.py
-    - spool-quiet.py
     - spool_cutover_gate.py
     - write_manifest.py
     - run_shm_perl.py
     - shm_exec_preflight.py
     - adapter_idempotency.py
     - immutable_recovery.py
+    - host_preflight.py
+    - parse_lsattr.py
   when: not ansible_check_mode | bool
 
 - name: Ensure application checkout directory exists
@@ -92,7 +119,6 @@
   args:
     chdir: "{{ vff_fiscal_app_dir }}"
   changed_when: false
-  failed_when: false
   when: not ansible_check_mode | bool
   # noqa: command-instead-of-module
 
@@ -102,7 +128,7 @@
     dest: "{{ vff_fiscal_app_dir }}"
     version: "{{ vff_fiscal_version }}"
     update: true
-    accept_hostkey: true
+    accept_hostkey: false
   when: not ansible_check_mode | bool
 
 - name: Verify requested commit object exists

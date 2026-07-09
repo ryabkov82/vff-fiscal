@@ -1,172 +1,251 @@
 ---
-- name: Validate adapter rollback backup directory variable
+- name: Validate adapter rollback request
   ansible.builtin.assert:
     that:
       - vff_fiscal_rollback_backup_dir is defined
       - vff_fiscal_rollback_backup_dir is string
       - vff_fiscal_rollback_backup_dir is match('^/opt/vff-fiscal/backups/releases/.+/adapter/?$')
-    fail_msg: vff_fiscal_rollback_backup_dir must point to an adapter backup under /opt/vff-fiscal/backups/releases/.
-
-- name: Require explicit rollback confirmation
-  ansible.builtin.assert:
-    that:
       - vff_fiscal_rollback_confirm | default(false) | bool
-    fail_msg: Set vff_fiscal_rollback_confirm=true to run adapter rollback.
+    fail_msg: A valid adapter backup directory and explicit rollback confirmation are required.
 
-- name: Initialize adapter rollback facts
+- name: Initialize adapter rollback transaction
   ansible.builtin.set_fact:
-    vff_fiscal_spool_was_paused: false
-    adapter_restore_enabled: "{{ vff_fiscal_rollback_adapter_enabled | default(false) | bool }}"
     adapter_rollback_backup_dir: "{{ vff_fiscal_rollback_backup_dir | regex_replace('/$', '') }}"
+    adapter_rollback_safety_dir: >-
+      {{ vff_fiscal_backup_root }}/{{ ansible_date_time.iso8601_basic_short }}-adapter-rollback-safety
+    vff_fiscal_adapter_restore_enabled: "{{ vff_fiscal_rollback_adapter_enabled | default(false) | bool }}"
+    adapter_files_modification_started: false
+    vff_fiscal_spool_gate_passed: false
+    vff_fiscal_spool_paused_by_operation: false
+    vff_fiscal_spool_was_already_paused: false
+    vff_fiscal_spool_leave_paused: false
 
-- name: Read adapter rollback metadata
+- name: Load current deploy manifest before adapter rollback
+  ansible.builtin.include_role:
+    name: vff_fiscal_common
+    tasks_from: load_deploy_state.yml
+  when: not ansible_check_mode | bool
+
+- name: Read requested adapter rollback metadata
   ansible.builtin.slurp:
     src: "{{ adapter_rollback_backup_dir }}/backup-meta.json"
   register: adapter_rollback_meta_raw
+  no_log: true
 
-- name: Parse adapter rollback metadata
+- name: Parse requested adapter rollback metadata
   ansible.builtin.set_fact:
     adapter_rollback_meta: "{{ adapter_rollback_meta_raw.content | b64decode | from_json }}"
 
-- name: Read safe SHM status from backup
-  ansible.builtin.slurp:
-    src: "{{ adapter_rollback_backup_dir }}/shm-status.json"
-  register: adapter_rollback_status_raw
+- name: Inspect current adapter files for safety backup
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    checksum_algorithm: sha256
+  register: adapter_rollback_current_files
+  loop:
+    - "{{ shm_adapter_path }}"
+    - "{{ shm_adapter_lib_dir }}/AdapterConfig.pm"
+    - "{{ shm_adapter_lib_dir }}/PaymentTimestamp.pm"
+  when: not ansible_check_mode | bool
 
-- name: Parse safe SHM status from backup
+- name: Read current safe adapter status
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+      - status
+  environment:
+    SHM_CONTAINER: "{{ shm_core_container }}"
+    DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+    SHM_SCRIPT: shm-config.pl
+  register: adapter_rollback_current_status_raw
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Parse current safe adapter status
   ansible.builtin.set_fact:
-    adapter_rollback_status: "{{ adapter_rollback_status_raw.content | b64decode | from_json }}"
+    adapter_rollback_current_status: "{{ adapter_rollback_current_status_raw.stdout | from_json }}"
+  when: not ansible_check_mode | bool
 
-- name: Adapter rollback block
+- name: Inspect current adapter immutable state
+  ansible.builtin.command:
+    argv:
+      - lsattr
+      - "{{ shm_adapter_path }}"
+  register: adapter_rollback_current_lsattr
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Parse current adapter immutable state
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/parse_lsattr.py"
+    stdin: "{{ adapter_rollback_current_lsattr.stdout }}"
+  register: adapter_rollback_current_immutable
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Create pre-rollback adapter safety backup
+  ansible.builtin.file:
+    path: "{{ adapter_rollback_safety_dir }}/lib/VFFFiscal"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  when: not ansible_check_mode | bool
+
+- name: Copy current adapter into pre-rollback safety backup
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ adapter_rollback_safety_dir }}/{{ item.dest }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: "{{ shm_adapter_path }}", dest: srv_customlab_nalog.cgi, mode: "0700" }
+    - { src: "{{ shm_adapter_lib_dir }}/AdapterConfig.pm", dest: lib/VFFFiscal/AdapterConfig.pm, mode: "0600" }
+    - { src: "{{ shm_adapter_lib_dir }}/PaymentTimestamp.pm", dest: lib/VFFFiscal/PaymentTimestamp.pm, mode: "0600" }
+  when: not ansible_check_mode | bool
+
+- name: Write pre-rollback adapter safety metadata
+  ansible.builtin.copy:
+    dest: "{{ adapter_rollback_safety_dir }}/backup-meta.json"
+    owner: root
+    group: root
+    mode: "0600"
+    content: >-
+      {{
+        {
+          'previous_commit': vff_fiscal_existing_deploy_state.adapter_commit | default('unknown-pre-manifest', true),
+          'previous_cgi_sha256': adapter_rollback_current_files.results[0].stat.checksum,
+          'previous_adapter_config_sha256': adapter_rollback_current_files.results[1].stat.checksum,
+          'previous_payment_timestamp_sha256': adapter_rollback_current_files.results[2].stat.checksum,
+          'previous_enabled': adapter_rollback_current_status.enabled | default(false) | bool,
+          'previous_immutable': 'immutable=1' in adapter_rollback_current_immutable.stdout_lines,
+          'created_at': ansible_date_time.iso8601
+        } | to_nice_json
+      }}
+  when: not ansible_check_mode | bool
+
+- name: Stage requested rollback adapter in shared SHM data
+  ansible.builtin.shell: |
+    set -euo pipefail
+    stage={{ (shm_adapter_stage_dir ~ '/manual-rollback-' ~ ansible_date_time.iso8601_basic_short) | quote }}
+    rm -rf "$stage"
+    mkdir -p "$stage/lib/VFFFiscal"
+    install -m 0755 {{ (adapter_rollback_backup_dir ~ '/srv_customlab_nalog.cgi') | quote }} \
+      "$stage/srv_customlab_nalog.cgi"
+    install -m 0644 {{ (adapter_rollback_backup_dir ~ '/lib-VFFFiscal/AdapterConfig.pm') | quote }} \
+      "$stage/lib/VFFFiscal/AdapterConfig.pm"
+    install -m 0644 {{ (adapter_rollback_backup_dir ~ '/lib-VFFFiscal/PaymentTimestamp.pm') | quote }} \
+      "$stage/lib/VFFFiscal/PaymentTimestamp.pm"
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: not ansible_check_mode | bool
+
+- name: Manual adapter rollback transaction
   when: not ansible_check_mode | bool
   block:
-    - name: Acquire SHM spool cutover gate before adapter rollback
+    - name: Apply requested adapter rollback
       ansible.builtin.include_role:
-        name: vff_fiscal_common
-        tasks_from: spool_cutover_gate.yml
+        name: vff_fiscal_adapter
+        tasks_from: restore_adapter.yml
+      vars:
+        vff_fiscal_adapter_restore_host_dir: >-
+          {{ shm_adapter_stage_dir }}/manual-rollback-{{ ansible_date_time.iso8601_basic_short }}
+        vff_fiscal_adapter_restore_container_dir: >-
+          {{ shm_pay_systems_container_dir }}/.vff-fiscal-stage/manual-rollback-{{ ansible_date_time.iso8601_basic_short }}
+        vff_fiscal_adapter_restore_expected_checksums:
+          srv_customlab_nalog.cgi: >-
+            {{ adapter_rollback_meta.previous_cgi_sha256
+            | default(adapter_rollback_meta.file_checksums.cgi | default('')) }}
+          lib/VFFFiscal/AdapterConfig.pm: >-
+            {{ adapter_rollback_meta.previous_adapter_config_sha256
+            | default(adapter_rollback_meta.file_checksums['AdapterConfig.pm'] | default('')) }}
+          lib/VFFFiscal/PaymentTimestamp.pm: >-
+            {{ adapter_rollback_meta.previous_payment_timestamp_sha256
+            | default(adapter_rollback_meta.file_checksums['PaymentTimestamp.pm'] | default('')) }}
 
-    - name: Clear need_update_to before adapter rollback replacement
-      ansible.builtin.command:
-        argv:
-          - python3
-          - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
-          - clear-update-marker
-      environment:
-        SHM_CONTAINER: "{{ shm_core_container }}"
-        DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
-        SHM_SCRIPT: shm-config.pl
-      changed_when: true
-
-    - name: Remove immutable flag before adapter rollback replacement
-      ansible.builtin.command: chattr -i {{ shm_adapter_path }}
-      changed_when: true
-      failed_when: false
-
-    - name: Restore backed-up adapter CGI during rollback
-      ansible.builtin.copy:
-        src: "{{ adapter_rollback_backup_dir }}/srv_customlab_nalog.cgi"
-        dest: "{{ shm_adapter_path }}"
-        remote_src: true
-        owner: "{{ shm_adapter_owner }}"
-        group: "{{ shm_adapter_group }}"
-        mode: "0755"
-
-    - name: Restore backed-up adapter helper directory during rollback
+  rescue:
+    - name: Stage pre-rollback safety backup for restoration
       ansible.builtin.shell: |
         set -euo pipefail
-        rm -rf {{ shm_adapter_lib_dir }}
-        cp -a {{ adapter_rollback_backup_dir }}/lib-VFFFiscal {{ shm_adapter_lib_dir }}
+        stage={{ (shm_adapter_stage_dir ~ '/rollback-safety-' ~ ansible_date_time.iso8601_basic_short) | quote }}
+        rm -rf "$stage"
+        mkdir -p "$stage/lib/VFFFiscal"
+        install -m 0755 {{ (adapter_rollback_safety_dir ~ '/srv_customlab_nalog.cgi') | quote }} \
+          "$stage/srv_customlab_nalog.cgi"
+        install -m 0644 {{ (adapter_rollback_safety_dir ~ '/lib/VFFFiscal/AdapterConfig.pm') | quote }} \
+          "$stage/lib/VFFFiscal/AdapterConfig.pm"
+        install -m 0644 {{ (adapter_rollback_safety_dir ~ '/lib/VFFFiscal/PaymentTimestamp.pm') | quote }} \
+          "$stage/lib/VFFFiscal/PaymentTimestamp.pm"
       args:
         executable: /bin/bash
       changed_when: true
 
-    - name: Compile restored adapter CGI after manual rollback
-      ansible.builtin.command: docker exec {{ shm_core_container }} perl -c {{ shm_adapter_container_path }}
-      changed_when: false
-
-    - name: Compile restored helper modules after manual rollback
-      ansible.builtin.command: docker exec {{ shm_core_container }} perl -c {{ shm_adapter_lib_container_dir }}/{{ item }}
-      loop:
-        - AdapterConfig.pm
-        - PaymentTimestamp.pm
-      changed_when: false
-
-    - name: Set adapter enabled state after rollback
-      ansible.builtin.command:
-        argv:
-          - python3
-          - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
-          - set-enabled
-          - "{{ adapter_restore_enabled | ternary('1', '0') }}"
-      environment:
-        SHM_CONTAINER: "{{ shm_core_container }}"
-        DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
-        SHM_SCRIPT: shm-config.pl
-      changed_when: true
-
-    - name: Ensure need_update_to remains cleared after adapter rollback
-      ansible.builtin.command:
-        argv:
-          - python3
-          - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
-          - clear-update-marker
-      environment:
-        SHM_CONTAINER: "{{ shm_core_container }}"
-        DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
-        SHM_SCRIPT: shm-config.pl
-      changed_when: true
-
-    - name: Restore immutable flag after adapter rollback replacement
-      ansible.builtin.command: chattr +i {{ shm_adapter_path }}
-      changed_when: true
-
-    - name: Verify immutable flag after adapter rollback
-      ansible.builtin.command: lsattr {{ shm_adapter_path }}
-      register: adapter_rollback_lsattr
-      changed_when: false
-      failed_when: "'i' not in adapter_rollback_lsattr.stdout"
-
-  always:
-    - name: Finalize adapter immutable protection and spool state after rollback
+    - name: Restore pre-rollback safety adapter
       ansible.builtin.include_role:
-        name: vff_fiscal_common
-        tasks_from: finalize_adapter_immutable.yml
+        name: vff_fiscal_adapter
+        tasks_from: restore_adapter.yml
+      vars:
+        vff_fiscal_adapter_restore_host_dir: >-
+          {{ shm_adapter_stage_dir }}/rollback-safety-{{ ansible_date_time.iso8601_basic_short }}
+        vff_fiscal_adapter_restore_container_dir: >-
+          {{ shm_pay_systems_container_dir }}/.vff-fiscal-stage/rollback-safety-{{ ansible_date_time.iso8601_basic_short }}
+        vff_fiscal_adapter_restore_enabled: "{{ adapter_rollback_current_status.enabled | default(false) | bool }}"
+        vff_fiscal_adapter_restore_expected_checksums:
+          srv_customlab_nalog.cgi: "{{ adapter_rollback_current_files.results[0].stat.checksum }}"
+          lib/VFFFiscal/AdapterConfig.pm: "{{ adapter_rollback_current_files.results[1].stat.checksum }}"
+          lib/VFFFiscal/PaymentTimestamp.pm: "{{ adapter_rollback_current_files.results[2].stat.checksum }}"
 
-- name: Compute restored adapter checksum
+    - name: Fail manual rollback after restoring pre-rollback adapter
+      ansible.builtin.fail:
+        msg: >-
+          Manual adapter rollback failed. The pre-rollback adapter safety backup
+          was restored transactionally; need_update_to remains cleared.
+
+- name: Load existing deploy manifest after adapter rollback
+  ansible.builtin.include_role:
+    name: vff_fiscal_common
+    tasks_from: load_deploy_state.yml
+  when: not ansible_check_mode | bool
+
+- name: Read restored adapter CGI checksum
   ansible.builtin.stat:
     path: "{{ shm_adapter_path }}"
     checksum_algorithm: sha256
   register: adapter_rollback_cgi_checksum
   when: not ansible_check_mode | bool
 
-- name: Load existing deploy manifest
-  ansible.builtin.include_role:
-    name: vff_fiscal_common
-    tasks_from: load_deploy_state.yml
-  when: not ansible_check_mode | bool
-
-- name: Write deploy state after adapter rollback
-  ansible.builtin.include_role:
-    name: vff_fiscal_common
-    tasks_from: write_deploy_state.yml
-  vars:
+- name: Prepare successful adapter rollback manifest
+  ansible.builtin.set_fact:
     vff_fiscal_common_manifest:
       service_commit: "{{ vff_fiscal_existing_deploy_state.service_commit | default('') }}"
       service_image: "{{ vff_fiscal_existing_deploy_state.service_image | default('') }}"
       service_image_id: "{{ vff_fiscal_existing_deploy_state.service_image_id | default('') }}"
       previous_service_image: "{{ vff_fiscal_existing_deploy_state.previous_service_image | default('') }}"
       previous_service_image_id: "{{ vff_fiscal_existing_deploy_state.previous_service_image_id | default('') }}"
-      adapter_commit: "{{ adapter_rollback_meta.commit | default('unknown') }}"
-      adapter_sha256: "{{ adapter_rollback_cgi_checksum.stat.checksum | default('unknown') }}"
+      adapter_commit: >-
+        {{ adapter_rollback_meta.previous_commit | default('unknown-pre-manifest', true) }}
+      adapter_sha256: "{{ adapter_rollback_cgi_checksum.stat.checksum }}"
       deployed_at: "{{ ansible_date_time.iso8601 }}"
-      backup_directory: "{{ adapter_rollback_backup_dir }}"
-      adapter_enabled: "{{ adapter_restore_enabled | bool }}"
+      backup_directory: "{{ adapter_rollback_safety_dir }}"
+      adapter_enabled: "{{ vff_fiscal_adapter_restore_enabled | bool }}"
       need_update_to_present: false
       deployment_status: adapter_rollback
+  when: not ansible_check_mode | bool
+
+- name: Write successful adapter rollback manifest
+  ansible.builtin.include_role:
+    name: vff_fiscal_common
+    tasks_from: write_deploy_state.yml
   when: not ansible_check_mode | bool
 
 - name: Report adapter rollback result
   ansible.builtin.debug:
     msg: >-
-      Adapter rollback completed from {{ adapter_rollback_backup_dir }} with enabled={{ adapter_restore_enabled }}.
-      need_update_to was kept cleared and state.json was not modified.
+      Adapter rollback completed with enabled={{ vff_fiscal_adapter_restore_enabled }}.
+      A pre-rollback safety backup is at {{ adapter_rollback_safety_dir }}.
+  when: not ansible_check_mode | bool

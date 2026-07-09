@@ -1,0 +1,204 @@
+---
+- name: Require complete staged adapter restore set
+  ansible.builtin.stat:
+    path: "{{ vff_fiscal_adapter_restore_host_dir }}/{{ item }}"
+    checksum_algorithm: sha256
+  register: adapter_restore_candidates
+  loop:
+    - srv_customlab_nalog.cgi
+    - lib/VFFFiscal/AdapterConfig.pm
+    - lib/VFFFiscal/PaymentTimestamp.pm
+
+- name: Validate complete staged adapter restore set
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - item.stat.checksum == vff_fiscal_adapter_restore_expected_checksums[item.item]
+    fail_msg: Adapter restore candidate is missing or has an unexpected checksum.
+  loop: "{{ adapter_restore_candidates.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Compile restore candidates in SHM core before pausing
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ shm_core_container }}"
+      - perl
+      - -c
+      - "{{ vff_fiscal_adapter_restore_container_dir }}/{{ item }}"
+  changed_when: false
+  loop:
+    - srv_customlab_nalog.cgi
+    - lib/VFFFiscal/AdapterConfig.pm
+    - lib/VFFFiscal/PaymentTimestamp.pm
+
+- name: Compile restore candidates in SHM spool before pausing
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ shm_spool_container }}"
+      - perl
+      - -c
+      - "{{ vff_fiscal_adapter_restore_container_dir }}/{{ item }}"
+  changed_when: false
+  loop:
+    - srv_customlab_nalog.cgi
+    - lib/VFFFiscal/AdapterConfig.pm
+    - lib/VFFFiscal/PaymentTimestamp.pm
+
+- name: Reset spool ownership before adapter restoration
+  ansible.builtin.set_fact:
+    vff_fiscal_spool_gate_passed: false
+    vff_fiscal_spool_paused_by_operation: false
+    vff_fiscal_spool_was_already_paused: false
+    vff_fiscal_spool_leave_paused: false
+
+- name: Adapter restoration protected transaction
+  block:
+    - name: Acquire spool gate for adapter restoration
+      ansible.builtin.include_role:
+        name: vff_fiscal_common
+        tasks_from: spool_cutover_gate.yml
+
+    - name: Clear need_update_to before adapter restoration
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+          - clear-update-marker
+      environment:
+        SHM_CONTAINER: "{{ shm_core_container }}"
+        DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+        SHM_SCRIPT: shm-config.pl
+      changed_when: true
+
+    - name: Mark adapter restoration modification started
+      ansible.builtin.set_fact:
+        adapter_files_modification_started: true
+
+    - name: Remove immutable flag for adapter restoration
+      ansible.builtin.command:
+        argv:
+          - chattr
+          - -i
+          - "{{ shm_adapter_path }}"
+      changed_when: true
+
+    - name: Restore adapter helper files atomically
+      ansible.builtin.shell: |
+        set -euo pipefail
+        install -o {{ shm_adapter_owner }} -g {{ shm_adapter_group }} -m 0644 \
+          {{ vff_fiscal_adapter_restore_host_dir }}/lib/VFFFiscal/{{ item }} \
+          {{ shm_adapter_lib_dir }}/{{ item }}.restore
+        mv {{ shm_adapter_lib_dir }}/{{ item }}.restore {{ shm_adapter_lib_dir }}/{{ item }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+      loop:
+        - AdapterConfig.pm
+        - PaymentTimestamp.pm
+
+    - name: Restore adapter CGI atomically
+      ansible.builtin.shell: |
+        set -euo pipefail
+        install -o {{ shm_adapter_owner }} -g {{ shm_adapter_group }} -m 0755 \
+          {{ vff_fiscal_adapter_restore_host_dir }}/srv_customlab_nalog.cgi \
+          {{ shm_adapter_path }}.restore
+        mv {{ shm_adapter_path }}.restore {{ shm_adapter_path }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Verify restored adapter checksums
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        checksum_algorithm: sha256
+      register: adapter_restored_files
+      loop:
+        - { path: "{{ shm_adapter_path }}", key: srv_customlab_nalog.cgi }
+        - { path: "{{ shm_adapter_lib_dir }}/AdapterConfig.pm", key: lib/VFFFiscal/AdapterConfig.pm }
+        - { path: "{{ shm_adapter_lib_dir }}/PaymentTimestamp.pm", key: lib/VFFFiscal/PaymentTimestamp.pm }
+
+    - name: Assert all restored adapter checksums
+      ansible.builtin.assert:
+        that:
+          - item.stat.checksum == vff_fiscal_adapter_restore_expected_checksums[item.item.key]
+        fail_msg: Restored adapter checksum mismatch for {{ item.item.key }}.
+      loop: "{{ adapter_restored_files.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+
+    - name: Compile restored files in SHM core while spool remains paused
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ shm_core_container }}"
+          - perl
+          - -c
+          - "{{ item }}"
+      changed_when: false
+      loop:
+        - "{{ shm_adapter_container_path }}"
+        - "{{ shm_adapter_lib_container_dir }}/AdapterConfig.pm"
+        - "{{ shm_adapter_lib_container_dir }}/PaymentTimestamp.pm"
+
+    - name: Restore safe adapter enabled state
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+          - set-enabled
+          - "{{ vff_fiscal_adapter_restore_enabled | bool | ternary('1', '0') }}"
+      environment:
+        SHM_CONTAINER: "{{ shm_core_container }}"
+        DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+        SHM_SCRIPT: shm-config.pl
+      changed_when: true
+
+  rescue:
+    - name: Mark failed adapter restoration for fail-closed finalization
+      ansible.builtin.set_fact:
+        vff_fiscal_spool_leave_paused: >-
+          {{ adapter_files_modification_started | default(false) | bool }}
+
+  always:
+    - name: Finalize immutable protection for adapter restoration
+      ansible.builtin.include_role:
+        name: vff_fiscal_common
+        tasks_from: finalize_adapter_immutable.yml
+
+- name: Compile restored files in SHM spool after unpause
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ shm_spool_container }}"
+      - perl
+      - -c
+      - "{{ item }}"
+  changed_when: false
+  loop:
+    - "{{ shm_adapter_container_path }}"
+    - "{{ shm_adapter_lib_container_dir }}/AdapterConfig.pm"
+    - "{{ shm_adapter_lib_container_dir }}/PaymentTimestamp.pm"
+  when: vff_fiscal_spool_paused_by_operation | default(false) | bool
+
+- name: Diagnose restored adapter in SHM spool
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ shm_spool_container }}"
+      - perl
+      - "{{ shm_adapter_container_path }}"
+  register: adapter_restore_diagnostic
+  changed_when: false
+  failed_when: >-
+    adapter_restore_diagnostic.rc != 0
+    or (adapter_restore_diagnostic.stdout | from_json).status | default(0) != 200
+  when: vff_fiscal_spool_paused_by_operation | default(false) | bool

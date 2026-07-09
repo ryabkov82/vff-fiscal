@@ -47,6 +47,12 @@ cp ansible/hosts.ini.example ansible/hosts.ini
 Edit `ansible/hosts.ini` locally with the real host name and SSH settings.
 Never commit `ansible/hosts.ini`.
 
+SSH host-key verification is enabled. Before the first connection, obtain the
+host key out of band, compare its fingerprint with the production operator, and
+only then add it to the controller's `known_hosts`. For example, capture a
+candidate with `ssh-keyscan <host>` and verify the fingerprint manually before
+installing it. Automation never accepts an unknown host key automatically.
+
 ## First-time setup
 
 1. Create `/opt/vff-fiscal`, `/opt/vff-fiscal/data`, and `/opt/vff-fiscal/backups/releases`.
@@ -136,14 +142,17 @@ This does **not** bypass server-side SHA, reachability, or clean-checkout checks
 2. Build image `vff-fiscal:<12-char-sha>` if missing or revision label mismatch
 3. Validate image exists locally and carries OCI label `org.opencontainers.image.revision`
 4. Render and validate Compose candidate (`docker compose config -q`, no `build:` section)
-5. Wait until no active `srv_customlab_nalog.cgi` process in `shm-spool-1`
-6. Pause `shm-spool-1`
-7. Re-check `state.json` for receipts with status `creating`
-8. Back up `state.json`, Compose, and manifest under a timestamped release directory (mode `0600`)
-9. Atomically replace Compose and run `docker compose up -d --no-deps --pull never vff-fiscal`
-10. Health check `/healthz` and authenticated `/v1/user` smoke test
-11. Write `/opt/vff-fiscal/deploy-state.json` atomically on success only
-12. Always unpause `shm-spool-1`
+5. Use `docker top` to wait until no active `srv_customlab_nalog.cgi` process
+6. Detect whether spool was already paused; pause it only when this operation owns the pause
+7. Confirm paused and immediately repeat `docker top` (which works while paused)
+8. If a process appeared in the race window, unpause only an operation-owned
+   pause and retry the complete gate for a bounded number of attempts
+9. Re-check `state.json` for receipts with status `creating`
+10. Back up `state.json`, Compose, and manifest under a timestamped release directory (mode `0600`)
+11. Atomically replace Compose and run `docker compose up -d --no-deps --pull never vff-fiscal`
+12. Health check `/healthz` and authenticated `/v1/user` smoke test
+13. Write `/opt/vff-fiscal/deploy-state.json` atomically on success only
+14. Unpause only when this operation paused spool, then verify `State.Paused=false`
 
 Idempotent re-deploy of the same running image skips steps 5–10 (no spool pause, no backups).
 
@@ -151,8 +160,7 @@ Idempotent re-deploy of the same running image skips steps 5–10 (no spool paus
 
 1. Stage CGI and helper modules under `/opt/shm/pay_systems/.vff-fiscal-stage/<sha>/`
 2. Compile staged files in `shm-core-1` and `shm-spool-1`
-3. Wait until no active adapter CGI process in `shm-spool-1`
-4. Pause `shm-spool-1` and confirm paused
+3. Acquire the bounded `docker top` quiet/pause/post-pause gate
 5. Back up live CGI, helper modules, ownership/modes/immutable metadata
 6. Clear `need_update_to` via `Core::Config::set_value` (not SHM UI)
 7. Verify `need_update_to` is null/undef
@@ -160,8 +168,10 @@ Idempotent re-deploy of the same running image skips steps 5–10 (no spool paus
 9. Compile installed files in both containers
 10. Restore previous `enabled` unless `vff_fiscal_adapter_enabled` is set
 11. Restore `chattr +i`, verify immutable flag and live SHA256
-12. Run safe adapter smoke tests
-13. Always attempt `chattr +i`, then unpause spool only when immutable flag is present
+12. Unpause only an operation-owned pause and verify it succeeded
+13. Compile in the running spool and run safe adapter smoke tests
+14. If post-unpause validation fails, reacquire the gate and transactionally
+    restore the previous CGI and both helpers
 
 At no point may `shm-spool-1` run while the live CGI lacks `chattr +i`.
 
@@ -193,12 +203,14 @@ Manual service rollback:
 
 - Requires `ROLLBACK_CONFIRM=1` and a service backup directory
 - Validates the rollback image exists locally (no rebuild, no pull)
-- Pauses spool, waits for quiet CGI, blocks on `creating` receipts
-- Backs up current `state.json` as `pre-rollback-state.json` only
+- Validates the backup Compose as a candidate before touching production
+- Acquires the spool gate and blocks on `creating` receipts
+- Creates a new rollback-operation backup of current state, Compose, and manifest
 - Restores backed-up Compose and runs `docker compose up -d --no-deps --pull never`
 - Verifies `/healthz` and authenticated `/v1/user`
+- Restores and validates the pre-rollback service if rollback validation fails
 - **Never restores `state.json` automatically**
-- Always unpauses spool
+- Never unpauses a spool that was already paused by an operator
 
 ## Adapter rollback
 
@@ -210,6 +222,10 @@ it could send FNS credentials and payment data to the old endpoint.
 
 Rollback restores CGI, both helper modules, ownership, modes, and immutable state.
 It clears `need_update_to` and does not restore it from backup.
+Before replacement it creates a fresh safety backup of the active adapter. Both
+manual rollback and automatic deployment rescue use the same staged,
+checksum-verified restoration transaction. If manual rollback fails, the safety
+backup is restored before the play fails.
 
 ```bash
 make rollback-adapter HOST=vff-fiscal BACKUP_DIR=... ROLLBACK_CONFIRM=1
@@ -274,6 +290,17 @@ containers are never recreated.
 - write manifests
 
 Runtime Docker/SHM validation still requires a live host check outside check mode.
+Skipped mutating tasks have initialized transaction facts, so check mode does not
+depend on results from checkout, build, staging, pause, or manifest tasks.
+
+## Backup metadata semantics
+
+Service backup metadata records `target_commit`, `target_image`,
+`previous_commit`, `previous_image`, `previous_image_id`, and whether a previous
+Compose existed. Adapter backup metadata records the target and previous commits,
+all three previous file checksums, previous enabled state, and previous immutable
+state. If a previous version predates `deploy-state.json`, its commit is recorded
+as `unknown-pre-manifest` rather than being inferred from the new target.
 
 ## Failure behavior (summary)
 

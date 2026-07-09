@@ -106,7 +106,9 @@
       healthz_status: "{{ status_health.status | default('unknown') }}"
       deployed_adapter_commit: "{{ status_deploy_state.adapter_commit | default('unknown') }}"
       active_adapter_sha256: "{{ status_adapter_cgi.stat.checksum | default('unknown') }}"
-      adapter_immutable: "{{ 'i' in (status_adapter_lsattr.stdout | default('')) }}"
+      adapter_immutable: >-
+        {{ status_adapter_lsattr.rc == 0
+        and 'i' in (status_adapter_lsattr.stdout.split() | first | default('')) }}
       adapter_diagnostic_message: "{{ status_adapter_diag.msg | default('unknown') }}"
       adapter_enabled: "{{ status_adapter_config.enabled | default('unknown') }}"
       need_update_to_defined: "{{ status_adapter_config.need_update_to_defined | default('unknown') }}"

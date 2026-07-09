@@ -17,12 +17,16 @@
 
 - name: Record SHM spool gate facts
   ansible.builtin.set_fact:
-    vff_fiscal_spool_gate_passed: true
-    vff_fiscal_spool_was_paused: >-
+    vff_fiscal_spool_gate_passed: "{{ vff_fiscal_spool_gate_result.rc == 0 }}"
+    vff_fiscal_spool_paused_by_operation: >-
       {{ (vff_fiscal_spool_gate_result.stdout_lines
-      | select('match', '^spool_was_paused_by_gate=') | first
-      | default('spool_was_paused_by_gate=0')).split('=')[1] == '1' }}
-  when: vff_fiscal_spool_gate_result.rc == 0
+      | select('match', '^spool_paused_by_gate=') | first
+      | default('spool_paused_by_gate=0')).split('=')[1] == '1' }}
+    vff_fiscal_spool_was_already_paused: >-
+      {{ (vff_fiscal_spool_gate_result.stdout_lines
+      | select('match', '^spool_was_already_paused=') | first
+      | default('spool_was_already_paused=0')).split('=')[1] == '1' }}
+    vff_fiscal_spool_leave_paused: false
 
 - name: Fail when SHM spool cutover gate could not be acquired
   ansible.builtin.fail:
