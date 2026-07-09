@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -39,6 +40,9 @@ run_shm_perl = load_module("run_shm_perl", COMMON / "files/run_shm_perl.py")
 deploy_lock = load_module("deploy_lock", COMMON / "files/deploy_lock.py")
 compose_service_image = load_module(
     "compose_service_image", COMMON / "files/compose_service_image.py"
+)
+shm_exec_preflight = load_module(
+    "shm_exec_preflight", COMMON / "files/shm_exec_preflight.py"
 )
 
 
@@ -189,6 +193,110 @@ class FakeDockerGateTests(unittest.TestCase):
         proc, _, _ = self.run_gate("probe_failure")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("spool_probe_failed=1", proc.stderr)
+
+
+class ShmExecPreflightTests(unittest.TestCase):
+    STDIN_PROBE = 'print "stdin_exec_ok=1\\n";'
+
+    def run_main(
+        self, side_effects: list[subprocess.CompletedProcess[str]]
+    ) -> tuple[int, mock.Mock, str]:
+        with mock.patch.object(shm_exec_preflight, "run", side_effect=side_effects) as run_mock:
+            with mock.patch.dict(
+                os.environ,
+                {"SHM_CONTAINER": "shm-core-1"},
+                clear=False,
+            ):
+                with mock.patch.object(
+                    shm_exec_preflight.sys, "stderr", new_callable=io.StringIO
+                ) as stderr_handle:
+                    rc = shm_exec_preflight.main()
+                    return rc, run_mock, stderr_handle.getvalue()
+
+    def test_successful_preflight_runs_checks_in_order(self) -> None:
+        side_effects = [
+            subprocess.CompletedProcess([], 1),
+            subprocess.CompletedProcess([], 0),
+            subprocess.CompletedProcess([], 0, "stdin_exec_ok=1\n"),
+        ]
+        rc, run_mock, _stderr = self.run_main(side_effects)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(run_mock.call_count, 3)
+
+        deploy_tools_call = run_mock.call_args_list[0]
+        self.assertEqual(
+            deploy_tools_call.args[0],
+            ["docker", "exec", "shm-core-1", "test", "-d", "/opt/vff-fiscal/deploy-tools"],
+        )
+        self.assertNotIn("input_text", deploy_tools_call.kwargs)
+
+        pay_systems_call = run_mock.call_args_list[1]
+        self.assertEqual(
+            pay_systems_call.args[0],
+            ["docker", "exec", "shm-core-1", "test", "-d", "/app/data/pay_systems"],
+        )
+        self.assertNotIn("input_text", pay_systems_call.kwargs)
+
+        stdin_probe_call = run_mock.call_args_list[2]
+        self.assertEqual(
+            stdin_probe_call.args[0],
+            ["docker", "exec", "-i", "shm-core-1", "sh", "-ec", "cd /app && exec perl -"],
+        )
+        self.assertEqual(stdin_probe_call.kwargs.get("input_text"), self.STDIN_PROBE)
+
+    def test_run_forwards_input_text_to_subprocess(self) -> None:
+        with mock.patch.object(shm_exec_preflight.subprocess, "run") as subprocess_run:
+            subprocess_run.return_value = subprocess.CompletedProcess([], 0)
+            shm_exec_preflight.run(["docker", "exec"], input_text=self.STDIN_PROBE)
+            subprocess_run.assert_called_once_with(
+                ["docker", "exec"],
+                input=self.STDIN_PROBE,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+    def test_legacy_input_keyword_is_rejected(self) -> None:
+        with self.assertRaises(TypeError):
+            shm_exec_preflight.run(["docker", "exec"], input=self.STDIN_PROBE)
+
+    def test_deploy_tools_mount_is_rejected(self) -> None:
+        rc, run_mock, stderr = self.run_main([subprocess.CompletedProcess([], 0)])
+        self.assertEqual(rc, 1)
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertIn("deploy_tools_mounted_in_container=1", stderr)
+
+    def test_pay_systems_directory_missing_is_rejected(self) -> None:
+        rc, run_mock, stderr = self.run_main(
+            [
+                subprocess.CompletedProcess([], 1),
+                subprocess.CompletedProcess([], 1),
+            ]
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(run_mock.call_count, 2)
+        self.assertIn("pay_systems_container_dir_missing=1", stderr)
+
+    def test_stdin_probe_failure_returns_rc_1(self) -> None:
+        base = [
+            subprocess.CompletedProcess([], 1),
+            subprocess.CompletedProcess([], 0),
+        ]
+
+        rc, run_mock, stderr = self.run_main(
+            base + [subprocess.CompletedProcess([], 1, "")]
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(run_mock.call_count, 3)
+        self.assertIn("stdin_exec_probe_failed=1", stderr)
+
+        rc, run_mock, stderr = self.run_main(
+            base + [subprocess.CompletedProcess([], 0, "unexpected output\n")]
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(run_mock.call_count, 3)
+        self.assertIn("stdin_exec_probe_failed=1", stderr)
 
 
 class HelperSafetyTests(unittest.TestCase):

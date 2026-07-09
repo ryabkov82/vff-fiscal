@@ -8,8 +8,18 @@ import subprocess
 import sys
 
 
-def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, capture_output=True, text=True, check=False)
+def run(
+    argv: list[str],
+    *,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def main() -> int:
@@ -28,7 +38,7 @@ def main() -> int:
 
     stdin_probe = run(
         ["docker", "exec", "-i", container, "sh", "-ec", "cd /app && exec perl -"],
-        input='print "stdin_exec_ok=1\\n";',
+        input_text='print "stdin_exec_ok=1\\n";',
     )
     if stdin_probe.returncode != 0 or "stdin_exec_ok=1" not in stdin_probe.stdout:
         print("stdin_exec_probe_failed=1", file=sys.stderr)
