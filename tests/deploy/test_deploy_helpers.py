@@ -16,6 +16,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[2]
 COMMON = ROOT / "ansible/roles/vff_fiscal_common"
 ADAPTER = ROOT / "ansible/roles/vff_fiscal_adapter"
@@ -44,6 +46,21 @@ compose_service_image = load_module(
 shm_exec_preflight = load_module(
     "shm_exec_preflight", COMMON / "files/shm_exec_preflight.py"
 )
+
+
+def iter_ansible_task_dicts(node):
+    if isinstance(node, list):
+        for item in node:
+            yield from iter_ansible_task_dicts(item)
+    elif isinstance(node, dict):
+        for key in ("tasks", "block", "always", "rescue", "pre_tasks", "post_tasks"):
+            if key in node:
+                yield from iter_ansible_task_dicts(node[key])
+        if any(
+            isinstance(key, str) and key.startswith(("ansible.", "community."))
+            for key in node
+        ):
+            yield node
 
 
 FAKE_DOCKER = r"""#!/usr/bin/env python3
@@ -297,6 +314,130 @@ class ShmExecPreflightTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(run_mock.call_count, 3)
         self.assertIn("stdin_exec_probe_failed=1", stderr)
+
+
+class DeployManifestTransactionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.manifest_tasks_path = COMMON / "tasks/write_deploy_state.yml"
+        cls.manifest_tasks = yaml.safe_load(cls.manifest_tasks_path.read_text())
+
+    def test_manifest_transaction_structure(self) -> None:
+        self.assertEqual(len(self.manifest_tasks), 1)
+        transaction = self.manifest_tasks[0]
+        self.assertEqual(transaction["name"], "Write deploy manifest transaction")
+        self.assertNotIn("rescue", transaction)
+        self.assertNotIn("ignore_errors", transaction)
+
+        block = transaction["block"]
+        always = transaction["always"]
+        self.assertEqual(len(block), 2)
+        self.assertEqual(len(always), 1)
+
+        render, write = block
+        cleanup = always[0]
+
+        self.assertEqual(render["name"], "Render deploy manifest payload")
+        self.assertEqual(write["name"], "Atomically write deploy manifest")
+        self.assertEqual(cleanup["name"], "Remove deploy manifest payload file")
+
+        for task in (render, write, cleanup):
+            self.assertTrue(task.get("no_log"), msg=task["name"])
+
+        template = render["ansible.builtin.template"]
+        self.assertEqual(template["owner"], "root")
+        self.assertEqual(template["group"], "root")
+        self.assertEqual(template["mode"], "0600")
+        self.assertTrue(str(template["dest"]).endswith(".payload"))
+
+        shell = write["ansible.builtin.shell"]
+        self.assertIn("set -euo pipefail", shell)
+        self.assertIn("write_manifest.py", shell)
+        self.assertEqual(write["args"]["executable"], "/bin/bash")
+        self.assertEqual(
+            write["environment"]["MANIFEST_PATH"],
+            "{{ vff_fiscal_deploy_state_path }}",
+        )
+
+        cleanup_file = cleanup["ansible.builtin.file"]
+        self.assertEqual(cleanup_file["path"], "{{ vff_fiscal_deploy_state_path }}.payload")
+        self.assertEqual(cleanup_file["state"], "absent")
+
+        render_index = self.manifest_tasks_path.read_text().index("Render deploy manifest payload")
+        write_index = self.manifest_tasks_path.read_text().index("Atomically write deploy manifest")
+        cleanup_index = self.manifest_tasks_path.read_text().index("Remove deploy manifest payload file")
+        self.assertLess(render_index, write_index)
+        self.assertLess(write_index, cleanup_index)
+
+    def test_pipefail_shell_tasks_use_bash(self) -> None:
+        violations: list[str] = []
+        for path in sorted((ROOT / "ansible").rglob("*.yml")):
+            try:
+                parsed = yaml.safe_load(path.read_text())
+            except yaml.YAMLError:
+                continue
+            if parsed is None:
+                continue
+            for task in iter_ansible_task_dicts(parsed):
+                shell = task.get("ansible.builtin.shell")
+                if not shell:
+                    continue
+                body = shell if isinstance(shell, str) else ""
+                if "set -euo pipefail" not in body:
+                    continue
+                args = task.get("args", {})
+                if args.get("executable") != "/bin/bash":
+                    violations.append(f"{path.relative_to(ROOT)}:{task.get('name', '<unnamed>')}")
+        self.assertEqual(violations, [])
+
+    def test_manifest_write_failure_remains_fatal_after_payload_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            payload = tmp_path / "deploy-state.json.payload"
+            payload.write_text('{"status":"ok"}\n', encoding="utf-8")
+            marker = tmp_path / "cleaned"
+            playbook = tmp_path / "play.yml"
+            playbook.write_text(
+                textwrap.dedent(
+                    f"""
+                    - hosts: localhost
+                      gather_facts: false
+                      tasks:
+                        - name: Write deploy manifest transaction
+                          block:
+                            - ansible.builtin.copy:
+                                dest: {payload}
+                                content: '{{"status":"ok"}}'
+                            - ansible.builtin.fail:
+                                msg: manifest write failed
+                          always:
+                            - ansible.builtin.file:
+                                path: {payload}
+                                state: absent
+                            - ansible.builtin.copy:
+                                dest: {marker}
+                                content: cleaned
+                    """
+                ),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    "ansible-playbook",
+                    "-i",
+                    "localhost,",
+                    "-c",
+                    "local",
+                    str(playbook),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(payload.exists())
+            self.assertTrue(marker.exists())
+            self.assertIn("manifest write failed", result.stdout)
 
 
 class HelperSafetyTests(unittest.TestCase):
