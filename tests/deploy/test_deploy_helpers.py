@@ -247,8 +247,23 @@ class HelperSafetyTests(unittest.TestCase):
     def test_deploy_lock_contention_and_owned_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             lock_dir = Path(tmp) / "deploy.lock"
-            self.assertEqual(deploy_lock.acquire(lock_dir, "deploy", "token-a"), 0)
-            self.assertEqual(deploy_lock.acquire(lock_dir, "deploy", "token-b"), 1)
+            self.assertEqual(
+                deploy_lock.acquire(lock_dir, "deploy", "token-a", "controller-a"),
+                0,
+            )
+            metadata = json.loads((lock_dir / "metadata.json").read_text())
+            self.assertEqual(metadata["controller_host"], "controller-a")
+            self.assertIn("managed_host", metadata)
+            self.assertIn("helper_pid", metadata)
+            self.assertNotIn("pid", metadata)
+            self.assertEqual(
+                deploy_lock.acquire(lock_dir, "deploy", "token-b", "controller-b"),
+                1,
+            )
+            self.assertEqual(
+                json.loads((lock_dir / "metadata.json").read_text())["token"],
+                "token-a",
+            )
             self.assertEqual(deploy_lock.release(lock_dir, "token-b"), 1)
             self.assertTrue(lock_dir.exists())
             self.assertEqual(deploy_lock.release(lock_dir, "token-a"), 0)
@@ -261,6 +276,8 @@ class HelperSafetyTests(unittest.TestCase):
                 textwrap.dedent(
                     """
                     services:
+                      sidecar:
+                        image: redis:7
                       vff-fiscal:
                         image: vff-fiscal:abcdef123456
                         pull_policy: never
@@ -272,6 +289,59 @@ class HelperSafetyTests(unittest.TestCase):
                 compose_service_image.service_image(compose, "vff-fiscal"),
                 "vff-fiscal:abcdef123456",
             )
+            old = compose_service_image.replace_service_image(
+                compose, "vff-fiscal", "vff-fiscal:111111111111"
+            )
+            self.assertEqual(old, "vff-fiscal:abcdef123456")
+            contents = compose.read_text()
+            self.assertIn("image: redis:7", contents)
+            self.assertIn("image: vff-fiscal:111111111111", contents)
+
+    def test_rescued_restoration_failure_remains_fatal_after_always(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            marker = tmp_path / "finalized"
+            playbook = tmp_path / "play.yml"
+            playbook.write_text(
+                textwrap.dedent(
+                    f"""
+                    - hosts: localhost
+                      gather_facts: false
+                      tasks:
+                        - name: Simulate restoration protected transaction
+                          block:
+                            - ansible.builtin.fail:
+                                msg: chattr failed
+                          rescue:
+                            - ansible.builtin.set_fact:
+                                adapter_restoration_failed: true
+                                vff_fiscal_spool_leave_paused: false
+                            - ansible.builtin.fail:
+                                msg: restoration remains fatal
+                          always:
+                            - ansible.builtin.copy:
+                                dest: {marker}
+                                content: finalized
+                    """
+                ),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    "ansible-playbook",
+                    "-i",
+                    "localhost,",
+                    "-c",
+                    "local",
+                    str(playbook),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(marker.exists())
+            self.assertIn("restoration remains fatal", result.stdout)
 
 
 class TransactionRoleTests(unittest.TestCase):
@@ -304,6 +374,7 @@ class TransactionRoleTests(unittest.TestCase):
         self.assertIn("docker", self.service)
         self.assertIn("tag", self.service)
         self.assertIn("Normalize legacy rollback Compose", self.service)
+        self.assertIn("Resolve normalized legacy rollback Compose image", self.service)
         self.assertIn("legacy_bootstrap", self.service)
 
     def test_fresh_checkout_skips_fetch_before_clone(self) -> None:
@@ -364,6 +435,19 @@ class TransactionRoleTests(unittest.TestCase):
         self.assertIn("restore_adapter.yml", self.adapter[post:])
         self.assertIn("spool_cutover_gate.yml", self.adapter_restore)
 
+    def test_restore_adapter_failure_rethrows_after_finalization(self) -> None:
+        self.assertIn("adapter_restoration_failed: false", self.adapter_restore)
+        self.assertIn("adapter_restoration_failed: true", self.adapter_restore)
+        self.assertIn("Fail adapter restoration transaction", self.adapter_restore)
+        self.assertLess(
+            self.adapter_restore.index("Fail adapter restoration transaction"),
+            self.adapter_restore.index("Finalize immutable protection for adapter restoration"),
+        )
+        post_transaction = self.adapter_restore[
+            self.adapter_restore.index("Compile restored files in SHM spool after unpause") :
+        ]
+        self.assertIn("not (adapter_restoration_failed | default(false) | bool)", post_transaction)
+
     def test_cutover_failure_has_single_restore_cycle(self) -> None:
         self.assertNotIn("Validate automatic rescue through reusable restoration transaction", self.adapter)
         self.assertEqual(
@@ -378,6 +462,17 @@ class TransactionRoleTests(unittest.TestCase):
         self.assertIn("pre-rollback adapter safety backup", self.adapter_rollback)
         self.assertIn("default(false)", self.adapter_rollback)
         self.assertGreaterEqual(self.adapter_rollback.count("restore_adapter.yml"), 2)
+
+    def test_manual_rollback_manifest_is_after_fatal_restore_transaction(self) -> None:
+        self.assertLess(
+            self.adapter_rollback.index("Manual adapter rollback transaction"),
+            self.adapter_rollback.index("Load existing deploy manifest after adapter rollback"),
+        )
+        self.assertIn("Fail manual rollback after restoring pre-rollback adapter", self.adapter_rollback)
+        self.assertLess(
+            self.adapter_rollback.index("Fail manual rollback after restoring pre-rollback adapter"),
+            self.adapter_rollback.index("Load existing deploy manifest after adapter rollback"),
+        )
 
     def test_no_spool_exec_in_paused_cutover_section(self) -> None:
         cutover = self.adapter[
@@ -451,6 +546,15 @@ class TransactionRoleTests(unittest.TestCase):
             self.assertIn("always:", content)
         status = (ROOT / "ansible/playbooks/deploy-status.yml").read_text()
         self.assertNotIn("deploy_lock", status)
+
+    def test_lock_release_requires_successful_acquire(self) -> None:
+        acquire = (COMMON / "tasks/acquire_deploy_lock.yml").read_text()
+        release = (COMMON / "tasks/release_deploy_lock.yml").read_text()
+        self.assertIn("vff_fiscal_deploy_lock_acquired: false", acquire)
+        self.assertIn("vff_fiscal_deploy_lock_acquired: true", acquire)
+        self.assertIn("vff_fiscal_deploy_lock_acquire.rc == 0", acquire)
+        self.assertIn("vff_fiscal_deploy_lock_acquired | default(false) | bool", release)
+        self.assertIn("--controller-host", acquire)
 
     def test_rollback_compose_image_is_verified_against_metadata(self) -> None:
         self.assertIn("Resolve service image from rollback Compose candidate", self.service_rollback)

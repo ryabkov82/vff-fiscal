@@ -11,3 +11,4 @@
   when:
     - not ansible_check_mode | bool
     - vff_fiscal_deploy_lock_token is defined
+    - vff_fiscal_deploy_lock_acquired | default(false) | bool

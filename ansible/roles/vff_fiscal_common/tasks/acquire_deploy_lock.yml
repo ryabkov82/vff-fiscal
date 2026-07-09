@@ -1,6 +1,7 @@
 ---
 - name: Initialize deployment lock token
   ansible.builtin.set_fact:
+    vff_fiscal_deploy_lock_acquired: false
     vff_fiscal_deploy_lock_token: >-
       {{ ansible_date_time.epoch }}-{{ 999999999 | random }}-{{ inventory_hostname }}
 
@@ -11,7 +12,15 @@
       --lock-dir {{ vff_fiscal_deploy_lock_path }}
       --operation {{ vff_fiscal_common_deploy_lock_operation | default('deployment') }}
       --token {{ vff_fiscal_deploy_lock_token }}
+      --controller-host {{ lookup('env', 'HOSTNAME') | default('unknown-controller', true) }}
   register: vff_fiscal_deploy_lock_acquire
   changed_when: vff_fiscal_deploy_lock_acquire.rc == 0
   failed_when: vff_fiscal_deploy_lock_acquire.rc != 0
   when: not ansible_check_mode | bool
+
+- name: Record deployment lock ownership
+  ansible.builtin.set_fact:
+    vff_fiscal_deploy_lock_acquired: true
+  when:
+    - not ansible_check_mode | bool
+    - vff_fiscal_deploy_lock_acquire.rc == 0

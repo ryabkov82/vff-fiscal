@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-def acquire(lock_dir: Path, operation: str, token: str) -> int:
+def acquire(lock_dir: Path, operation: str, token: str, controller_host: str) -> int:
     lock_dir.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     try:
         lock_dir.mkdir(mode=0o700)
@@ -25,9 +25,10 @@ def acquire(lock_dir: Path, operation: str, token: str) -> int:
     metadata = {
         "operation": operation,
         "token": token,
-        "controller_host": socket.gethostname(),
+        "controller_host": controller_host or "unknown-controller",
+        "managed_host": socket.gethostname(),
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "pid": os.getpid(),
+        "helper_pid": os.getpid(),
     }
     (lock_dir / "token").write_text(token, encoding="utf-8")
     (lock_dir / "metadata.json").write_text(
@@ -60,10 +61,11 @@ def main() -> int:
     parser.add_argument("--lock-dir", required=True)
     parser.add_argument("--operation", default="")
     parser.add_argument("--token", required=True)
+    parser.add_argument("--controller-host", default="unknown-controller")
     args = parser.parse_args()
     lock_dir = Path(args.lock_dir)
     if args.action == "acquire":
-        return acquire(lock_dir, args.operation, args.token)
+        return acquire(lock_dir, args.operation, args.token, args.controller_host)
     return release(lock_dir, args.token)
 
 

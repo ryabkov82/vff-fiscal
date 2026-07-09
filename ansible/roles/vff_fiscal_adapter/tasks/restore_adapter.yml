@@ -52,6 +52,7 @@
 
 - name: Reset spool ownership before adapter restoration
   ansible.builtin.set_fact:
+    adapter_restoration_failed: false
     vff_fiscal_spool_gate_passed: false
     vff_fiscal_spool_paused_by_operation: false
     vff_fiscal_spool_was_already_paused: false
@@ -195,8 +196,16 @@
   rescue:
     - name: Mark failed adapter restoration for fail-closed finalization
       ansible.builtin.set_fact:
+        adapter_restoration_failed: true
         vff_fiscal_spool_leave_paused: >-
           {{ adapter_files_modification_started | default(false) | bool }}
+
+    - name: Fail adapter restoration transaction
+      ansible.builtin.fail:
+        msg: >-
+          Adapter restoration failed before completion. Immutable finalization
+          will run before the failure leaves this task include; callers must not
+          write a success manifest.
 
   always:
     - name: Finalize immutable protection for adapter restoration
@@ -218,7 +227,9 @@
     - "{{ shm_adapter_container_path }}"
     - "{{ shm_adapter_lib_container_dir }}/AdapterConfig.pm"
     - "{{ shm_adapter_lib_container_dir }}/PaymentTimestamp.pm"
-  when: vff_fiscal_spool_paused_by_operation | default(false) | bool
+  when:
+    - vff_fiscal_spool_paused_by_operation | default(false) | bool
+    - not (adapter_restoration_failed | default(false) | bool)
 
 - name: Diagnose restored adapter in SHM spool
   ansible.builtin.command:
@@ -233,4 +244,6 @@
   failed_when: >-
     adapter_restore_diagnostic.rc != 0
     or (adapter_restore_diagnostic.stdout | from_json).status | default(0) != 200
-  when: vff_fiscal_spool_paused_by_operation | default(false) | bool
+  when:
+    - vff_fiscal_spool_paused_by_operation | default(false) | bool
+    - not (adapter_restoration_failed | default(false) | bool)

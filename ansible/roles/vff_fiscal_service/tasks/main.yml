@@ -397,10 +397,49 @@
       when: service_compose_stat.stat.exists | default(false)
 
     - name: Normalize legacy rollback Compose to immutable local alias
-      ansible.builtin.replace:
-        path: "{{ service_backup_dir }}/docker-compose.yml"
-        regexp: ^(\s*image:\s*).*$
-        replace: \1{{ service_legacy_image_alias }}
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/../roles/vff_fiscal_common/files/compose_service_image.py
+          --compose-file {{ service_backup_dir }}/docker-compose.yml
+          --service {{ vff_fiscal_container_name }}
+          --replace-image {{ service_legacy_image_alias }}
+      register: service_legacy_compose_normalize
+      changed_when: true
+      when:
+        - service_compose_stat.stat.exists | default(false)
+        - service_legacy_bootstrap | bool
+
+    - name: Validate normalized legacy rollback Compose
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ service_backup_dir }}/docker-compose.yml"
+          - config
+          - -q
+      changed_when: false
+      when:
+        - service_compose_stat.stat.exists | default(false)
+        - service_legacy_bootstrap | bool
+
+    - name: Resolve normalized legacy rollback Compose image
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/../roles/vff_fiscal_common/files/compose_service_image.py
+          --compose-file {{ service_backup_dir }}/docker-compose.yml
+          --service {{ vff_fiscal_container_name }}
+      register: service_legacy_compose_image
+      changed_when: false
+      when:
+        - service_compose_stat.stat.exists | default(false)
+        - service_legacy_bootstrap | bool
+
+    - name: Assert normalized legacy rollback Compose image
+      ansible.builtin.assert:
+        that:
+          - service_legacy_compose_image.stdout | trim == service_legacy_image_alias
+        fail_msg: Legacy rollback Compose does not reference the immutable local alias.
       when:
         - service_compose_stat.stat.exists | default(false)
         - service_legacy_bootstrap | bool
