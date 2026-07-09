@@ -1,0 +1,32 @@
+---
+- name: Acquire SHM spool cutover gate
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/spool_cutover_gate.py"
+  environment:
+    SPOOL_CONTAINER: "{{ shm_spool_container }}"
+    CGI_NAME: srv_customlab_nalog.cgi
+    QUIET_RETRIES: "{{ vff_fiscal_spool_quiet_retries | string }}"
+    QUIET_DELAY: "{{ vff_fiscal_spool_quiet_delay | string }}"
+    GATE_ATTEMPTS: "{{ vff_fiscal_spool_gate_attempts | string }}"
+    GATE_RETRY_DELAY: "{{ vff_fiscal_spool_gate_retry_delay | string }}"
+  register: vff_fiscal_spool_gate_result
+  changed_when: false
+  failed_when: false
+
+- name: Record SHM spool gate facts
+  ansible.builtin.set_fact:
+    vff_fiscal_spool_gate_passed: true
+    vff_fiscal_spool_was_paused: >-
+      {{ (vff_fiscal_spool_gate_result.stdout_lines
+      | select('match', '^spool_was_paused_by_gate=') | first
+      | default('spool_was_paused_by_gate=0')).split('=')[1] == '1' }}
+  when: vff_fiscal_spool_gate_result.rc == 0
+
+- name: Fail when SHM spool cutover gate could not be acquired
+  ansible.builtin.fail:
+    msg: >-
+      SHM spool cutover gate failed after bounded retries. Spool was left unpaused
+      when possible. Inspect active srv_customlab_nalog.cgi processes before retrying.
+  when: vff_fiscal_spool_gate_result.rc != 0

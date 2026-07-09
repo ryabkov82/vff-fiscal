@@ -1,0 +1,34 @@
+services:
+  {{ vff_fiscal_container_name }}:
+    image: {{ vff_fiscal_image_repository }}:{{ deploy_short_sha }}
+    pull_policy: never
+    container_name: {{ vff_fiscal_container_name }}
+    restart: unless-stopped
+    env_file:
+      - {{ vff_fiscal_env_file }}
+    volumes:
+      - {{ vff_fiscal_data_dir }}:/var/lib/vff-fiscal
+    networks:
+      - shm
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 128m
+    ports:
+      - "127.0.0.1:{{ vff_fiscal_host_port }}:{{ vff_fiscal_container_port }}"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:{{ vff_fiscal_container_port }}/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+networks:
+  shm:
+    external: true
+    name: {{ vff_fiscal_docker_network }}

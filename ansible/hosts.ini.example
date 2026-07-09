@@ -1,0 +1,2 @@
+[vff_fiscal]
+vff-fiscal ansible_host=production.example.invalid ansible_user=root

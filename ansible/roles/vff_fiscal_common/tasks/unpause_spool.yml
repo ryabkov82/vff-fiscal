@@ -1,0 +1,6 @@
+---
+- name: Unpause SHM spool after cutover window
+  ansible.builtin.command: docker unpause {{ shm_spool_container }}
+  changed_when: true
+  failed_when: false
+  when: vff_fiscal_spool_was_paused | default(false) | bool

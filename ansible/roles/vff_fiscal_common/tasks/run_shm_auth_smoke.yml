@@ -1,0 +1,13 @@
+---
+- name: Run SHM auth smoke helper via stdin
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+  environment:
+    SHM_CONTAINER: "{{ shm_spool_container }}"
+    DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+    SHM_SCRIPT: shm-auth-smoke.pl
+  register: vff_fiscal_shm_auth_smoke_result
+  changed_when: false
+  no_log: true

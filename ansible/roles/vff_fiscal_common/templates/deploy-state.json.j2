@@ -1,0 +1,14 @@
+{
+  "service_commit": {{ vff_fiscal_common_manifest.service_commit | default(none) | to_json }},
+  "adapter_commit": {{ vff_fiscal_common_manifest.adapter_commit | default(none) | to_json }},
+  "service_image": {{ vff_fiscal_common_manifest.service_image | default(none) | to_json }},
+  "service_image_id": {{ vff_fiscal_common_manifest.service_image_id | default(none) | to_json }},
+  "adapter_sha256": {{ vff_fiscal_common_manifest.adapter_sha256 | default(none) | to_json }},
+  "deployed_at": {{ vff_fiscal_common_manifest.deployed_at | default(none) | to_json }},
+  "backup_directory": {{ vff_fiscal_common_manifest.backup_directory | default(none) | to_json }},
+  "previous_service_image": {{ vff_fiscal_common_manifest.previous_service_image | default(none) | to_json }},
+  "previous_service_image_id": {{ vff_fiscal_common_manifest.previous_service_image_id | default(none) | to_json }},
+  "adapter_enabled": {{ vff_fiscal_common_manifest.adapter_enabled | default(false) | to_json }},
+  "need_update_to_present": {{ vff_fiscal_common_manifest.need_update_to_present | default(false) | to_json }},
+  "deployment_status": {{ vff_fiscal_common_manifest.deployment_status | default('unknown') | to_json }}
+}

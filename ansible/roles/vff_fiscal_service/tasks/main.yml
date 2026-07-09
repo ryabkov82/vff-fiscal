@@ -1,0 +1,502 @@
+---
+- name: Initialize service deployment facts
+  ansible.builtin.set_fact:
+    service_backup_dir: "{{ vff_fiscal_backup_root }}/{{ deploy_timestamp }}-{{ deploy_short_sha }}/service"
+    service_target_image: "{{ vff_fiscal_image_repository }}:{{ deploy_short_sha }}"
+    service_cutover_required: true
+    service_image_build_required: true
+    service_had_running_container: false
+    service_previous_image: ""
+    service_previous_image_id: ""
+    service_previous_compose_existed: false
+    vff_fiscal_spool_was_paused: false
+
+- name: Install service deployment helper scripts
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ vff_fiscal_deploy_tools_dir }}/{{ item }}"
+    mode: "0750"
+    owner: root
+    group: root
+  loop:
+    - validate-env.py
+    - inspect-state.py
+    - auth-smoke.py
+  when: not ansible_check_mode | bool
+
+- name: Assert service environment file exists
+  ansible.builtin.stat:
+    path: "{{ vff_fiscal_env_file }}"
+  register: service_env_stat
+
+- name: Require service environment file
+  ansible.builtin.assert:
+    that:
+      - service_env_stat.stat.exists
+      - service_env_stat.stat.isreg
+    fail_msg: "{{ vff_fiscal_env_file }} must exist as a regular file."
+
+- name: Assert service environment file permissions
+  ansible.builtin.assert:
+    that:
+      - service_env_stat.stat.mode | int <= 384
+    fail_msg: "{{ vff_fiscal_env_file }} must be mode 0600 or stricter."
+
+- name: Assert state file exists
+  ansible.builtin.stat:
+    path: "{{ vff_fiscal_state_path }}"
+  register: service_state_stat
+
+- name: Require persistent state file
+  ansible.builtin.assert:
+    that:
+      - service_state_stat.stat.exists
+      - service_state_stat.stat.isreg
+      - service_state_stat.stat.uid == vff_fiscal_runtime_uid
+      - service_state_stat.stat.gid == vff_fiscal_runtime_gid
+      - service_state_stat.stat.mode | int == 384
+    fail_msg: >-
+      {{ vff_fiscal_state_path }} must exist, be owned by
+      {{ vff_fiscal_runtime_uid }}:{{ vff_fiscal_runtime_gid }}, mode 0600.
+
+- name: Validate required environment keys
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/validate-env.py"
+  environment:
+    ENV_FILE: "{{ vff_fiscal_env_file }}"
+    REQUIRED_KEYS: "{{ vff_fiscal_required_env_keys | join(',') }}"
+  changed_when: false
+  no_log: true
+  when: not ansible_check_mode | bool
+
+- name: Validate state file structure without blocking on creating receipts
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/inspect-state.py"
+  environment:
+    STATE_FILE: "{{ vff_fiscal_state_path }}"
+    BLOCK_CREATING: "0"
+  register: service_state_structure
+  changed_when: false
+  failed_when: service_state_structure.rc != 0
+  no_log: true
+  when: not ansible_check_mode | bool
+
+- name: Check whether service container is currently running
+  ansible.builtin.command: docker inspect -f '{{ "{{" }}.State.Running{{ "}}" }}' {{ vff_fiscal_container_name }}
+  register: service_container_running_probe
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Record whether service container was running
+  ansible.builtin.set_fact:
+    service_had_running_container: "{{ service_container_running_probe.rc == 0 and service_container_running_probe.stdout == 'true' }}"
+  when: not ansible_check_mode | bool
+
+- name: Read current service container image tag
+  ansible.builtin.command: docker inspect -f '{{ "{{" }}.Config.Image{{ "}}" }}' {{ vff_fiscal_container_name }}
+  register: service_current_image_tag
+  changed_when: false
+  when:
+    - not ansible_check_mode | bool
+    - service_had_running_container | bool
+
+- name: Read current service container image ID
+  ansible.builtin.command: docker inspect -f '{{ "{{" }}.Image{{ "}}" }}' {{ vff_fiscal_container_name }}
+  register: service_current_image_id
+  changed_when: false
+  when:
+    - not ansible_check_mode | bool
+    - service_had_running_container | bool
+
+- name: Record previous service image metadata
+  ansible.builtin.set_fact:
+    service_previous_image: "{{ service_current_image_tag.stdout }}"
+    service_previous_image_id: "{{ service_current_image_id.stdout }}"
+  when:
+    - not ansible_check_mode | bool
+    - service_had_running_container | bool
+
+- name: Probe target service image
+  ansible.builtin.command: docker image inspect {{ service_target_image }}
+  register: service_target_image_probe
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Read target image revision label when present
+  ansible.builtin.command: >-
+    docker image inspect {{ service_target_image }}
+    --format {{ '{{ index .Config.Labels "org.opencontainers.image.revision" }}' | quote }}
+  register: service_target_image_revision
+  changed_when: false
+  when:
+    - not ansible_check_mode | bool
+    - service_target_image_probe.rc == 0
+
+- name: Decide whether image build is required
+  ansible.builtin.set_fact:
+    service_image_build_required: >-
+      {{
+        service_target_image_probe.rc != 0
+        or service_target_image_revision.stdout != vff_fiscal_version
+      }}
+  when: not ansible_check_mode | bool
+
+- name: Build target service image
+  ansible.builtin.command:
+    argv: >-
+      {{
+        ['docker', 'build']
+        + (['--pull'] if vff_fiscal_docker_build_pull | bool else [])
+        + [
+          '--label', 'org.opencontainers.image.revision=' ~ vff_fiscal_version,
+          '--label', 'org.opencontainers.image.source=' ~ vff_fiscal_repo_url,
+          '-t', service_target_image,
+          vff_fiscal_app_dir
+        ]
+      }}
+  changed_when: true
+  when:
+    - not ansible_check_mode | bool
+    - service_image_build_required | bool
+
+- name: Validate target service image exists locally
+  ansible.builtin.command: docker image inspect {{ service_target_image }}
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Read built service image ID
+  ansible.builtin.command: docker image inspect -f '{{ "{{" }}.Id{{ "}}" }}' {{ service_target_image }}
+  register: service_target_image_id
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Read built image revision label
+  ansible.builtin.command: >-
+    docker image inspect {{ service_target_image }}
+    --format {{ '{{ index .Config.Labels "org.opencontainers.image.revision" }}' | quote }}
+  register: service_built_image_revision
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Assert built image revision label
+  ansible.builtin.assert:
+    that:
+      - service_built_image_revision.stdout == vff_fiscal_version
+    fail_msg: Built image revision label does not match requested commit.
+  when: not ansible_check_mode | bool
+
+- name: Render candidate compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ vff_fiscal_compose_path }}.new"
+    owner: root
+    group: root
+    mode: "0600"
+  when: not ansible_check_mode | bool
+
+- name: Validate candidate compose file
+  ansible.builtin.command: docker compose -f {{ vff_fiscal_compose_path }}.new config -q
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Assert candidate compose file has no build section
+  ansible.builtin.command: grep -q '^[[:space:]]*build:' {{ vff_fiscal_compose_path }}.new
+  register: service_compose_build_probe
+  changed_when: false
+  failed_when: service_compose_build_probe.rc == 0
+  when: not ansible_check_mode | bool
+
+- name: Query health endpoint before cutover
+  ansible.builtin.uri:
+    url: http://127.0.0.1:{{ vff_fiscal_host_port }}/healthz
+    return_content: true
+  register: service_preflight_health
+  failed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Decide whether service cutover is required
+  ansible.builtin.set_fact:
+    service_cutover_required: >-
+      {{
+        not (
+          service_had_running_container | bool
+          and service_current_image_tag.stdout | default('') == service_target_image
+          and service_preflight_health.status | default(0) == 200
+          and (service_preflight_health.json.status | default('')) == 'ok'
+        )
+      }}
+  when: not ansible_check_mode | bool
+
+- name: Report idempotent service deployment skip
+  ansible.builtin.debug:
+    msg: >-
+      Target image {{ service_target_image }} is already running and healthy.
+      Skipping spool pause, backups, and container recreation.
+  when:
+    - not ansible_check_mode | bool
+    - not service_cutover_required | bool
+
+- name: Service cutover block
+  when:
+    - not ansible_check_mode | bool
+    - service_cutover_required | bool
+  block:
+    - name: Acquire SHM spool cutover gate before service cutover
+      ansible.builtin.include_role:
+        name: vff_fiscal_common
+        tasks_from: spool_cutover_gate.yml
+
+    - name: Re-check state for creating receipts after spool pause
+      ansible.builtin.include_role:
+        name: vff_fiscal_common
+        tasks_from: assert_no_creating_receipts.yml
+
+    - name: Create service backup directory
+      ansible.builtin.file:
+        path: "{{ service_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Back up state file after spool pause
+      ansible.builtin.copy:
+        src: "{{ vff_fiscal_state_path }}"
+        dest: "{{ service_backup_dir }}/state.json"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Check existing compose file
+      ansible.builtin.stat:
+        path: "{{ vff_fiscal_compose_path }}"
+      register: service_compose_stat
+
+    - name: Back up existing compose file
+      ansible.builtin.copy:
+        src: "{{ vff_fiscal_compose_path }}"
+        dest: "{{ service_backup_dir }}/docker-compose.yml"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      when: service_compose_stat.stat.exists | default(false)
+
+    - name: Record previous compose presence
+      ansible.builtin.set_fact:
+        service_previous_compose_existed: "{{ service_compose_stat.stat.exists | default(false) }}"
+
+    - name: Check existing deploy state for backup
+      ansible.builtin.stat:
+        path: "{{ vff_fiscal_deploy_state_path }}"
+      register: service_deploy_state_backup_stat
+
+    - name: Back up existing deploy state
+      ansible.builtin.copy:
+        src: "{{ vff_fiscal_deploy_state_path }}"
+        dest: "{{ service_backup_dir }}/deploy-state.json"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      when: service_deploy_state_backup_stat.stat.exists | default(false)
+      no_log: true
+
+    - name: Prepare service backup metadata
+      ansible.builtin.set_fact:
+        service_backup_metadata:
+          component: service
+          commit: "{{ vff_fiscal_version }}"
+          image: "{{ service_target_image }}"
+          rollback_image: "{{ service_previous_image }}"
+          backup_directory: "{{ service_backup_dir }}"
+          deployed_at: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Write service backup metadata
+      ansible.builtin.copy:
+        dest: "{{ service_backup_dir }}/backup-meta.json"
+        owner: root
+        group: root
+        mode: "0600"
+        content: "{{ service_backup_metadata | to_nice_json }}"
+
+    - name: Atomically replace compose file
+      ansible.builtin.command: mv {{ vff_fiscal_compose_path }}.new {{ vff_fiscal_compose_path }}
+      changed_when: true
+
+    - name: Start updated vff-fiscal service
+      ansible.builtin.command: >-
+        docker compose -f {{ vff_fiscal_compose_path }}
+        up -d --no-deps --pull never {{ vff_fiscal_container_name }}
+      changed_when: true
+
+    - name: Wait for health endpoint
+      ansible.builtin.uri:
+        url: http://127.0.0.1:{{ vff_fiscal_host_port }}/healthz
+        return_content: true
+      register: service_health_check
+      until: service_health_check.status == 200 and (service_health_check.json.status | default('')) == 'ok'
+      retries: 18
+      delay: 5
+
+    - name: Assert container is running and healthy
+      ansible.builtin.command: >-
+        docker inspect -f '{{ "{{" }}.State.Running{{ "}}" }} {{ "{{" }}.State.Health.Status{{ "}}" }}'
+        {{ vff_fiscal_container_name }}
+      register: service_container_health
+      changed_when: false
+      failed_when: service_container_health.stdout != 'true healthy'
+
+    - name: Authenticated user smoke test
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/auth-smoke.py"
+      environment:
+        ENV_FILE: "{{ vff_fiscal_env_file }}"
+        USER_URL: http://127.0.0.1:{{ vff_fiscal_host_port }}/v1/user
+      register: service_auth_smoke
+      changed_when: false
+      failed_when: service_auth_smoke.rc != 0
+      no_log: true
+
+    - name: Report authenticated user smoke test result
+      ansible.builtin.debug:
+        msg: authenticated_user_check=ok
+      when: service_auth_smoke.rc == 0
+
+  rescue:
+    - name: Restore previous compose file after failure
+      ansible.builtin.copy:
+        src: "{{ service_backup_dir }}/docker-compose.yml"
+        dest: "{{ vff_fiscal_compose_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      when: service_previous_compose_existed | default(false) | bool
+
+    - name: Start previous service image after failure
+      ansible.builtin.command: >-
+        docker compose -f {{ vff_fiscal_compose_path }}
+        up -d --no-deps --pull never {{ vff_fiscal_container_name }}
+      when: service_previous_compose_existed | default(false) | bool
+      changed_when: true
+
+    - name: Wait for rollback health endpoint
+      ansible.builtin.uri:
+        url: http://127.0.0.1:{{ vff_fiscal_host_port }}/healthz
+        return_content: true
+      register: service_rollback_health
+      until: service_rollback_health.status == 200 and (service_rollback_health.json.status | default('')) == 'ok'
+      retries: 12
+      delay: 5
+      when: service_previous_compose_existed | default(false) | bool
+
+    - name: Remove failed new container when no previous service existed
+      ansible.builtin.command: docker rm -f {{ vff_fiscal_container_name }}
+      changed_when: true
+      failed_when: false
+      when: not service_previous_compose_existed | default(false) | bool
+
+    - name: Fail play after automatic service rollback
+      ansible.builtin.fail:
+        msg: >-
+          Service deployment failed and was rolled back to the previous compose/image when available.
+          state.json was intentionally not restored. Inspect backup at {{ service_backup_dir }}.
+
+  always:
+    - name: Unpause SHM spool after service deployment
+      ansible.builtin.include_role:
+        name: vff_fiscal_common
+        tasks_from: unpause_spool.yml
+
+- name: Remove stale candidate compose file when cutover skipped
+  ansible.builtin.file:
+    path: "{{ vff_fiscal_compose_path }}.new"
+    state: absent
+  when:
+    - not ansible_check_mode | bool
+    - not service_cutover_required | bool
+
+- name: Load existing deploy manifest
+  ansible.builtin.include_role:
+    name: vff_fiscal_common
+    tasks_from: load_deploy_state.yml
+  when: not ansible_check_mode | bool
+
+- name: Read SHM adapter safe status for manifest via stdin helper
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+      - status
+  environment:
+    SHM_CONTAINER: "{{ shm_core_container }}"
+    DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+    SHM_SCRIPT: shm-config.pl
+  register: service_adapter_status_raw
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Parse SHM adapter safe status for manifest
+  ansible.builtin.set_fact:
+    service_adapter_status: "{{ service_adapter_status_raw.stdout | from_json }}"
+  when:
+    - not ansible_check_mode | bool
+    - service_adapter_status_raw.rc == 0
+
+- name: Default SHM adapter safe status for manifest
+  ansible.builtin.set_fact:
+    service_adapter_status: {}
+  when:
+    - not ansible_check_mode | bool
+    - service_adapter_status_raw.rc != 0
+
+- name: Prepare service deploy manifest
+  ansible.builtin.set_fact:
+    vff_fiscal_common_manifest:
+      service_commit: "{{ vff_fiscal_version }}"
+      service_image: "{{ service_target_image }}"
+      service_image_id: "{{ service_target_image_id.stdout }}"
+      deployed_at: "{{ ansible_date_time.iso8601 }}"
+      backup_directory: >-
+        {{ service_backup_dir if service_cutover_required | bool
+        else vff_fiscal_existing_deploy_state.backup_directory | default('') }}
+      previous_service_image: >-
+        {{ service_previous_image if service_previous_image | length > 0
+        else vff_fiscal_existing_deploy_state.previous_service_image | default('') }}
+      previous_service_image_id: >-
+        {{ service_previous_image_id if service_previous_image_id | length > 0
+        else vff_fiscal_existing_deploy_state.previous_service_image_id | default('') }}
+      adapter_commit: "{{ vff_fiscal_existing_deploy_state.adapter_commit | default('') }}"
+      adapter_sha256: "{{ vff_fiscal_existing_deploy_state.adapter_sha256 | default('') }}"
+      adapter_enabled: >-
+        {{ service_adapter_status.enabled
+        | default(vff_fiscal_existing_deploy_state.adapter_enabled | default(false)) | bool }}
+      need_update_to_present: >-
+        {{ service_adapter_status.need_update_to_defined
+        | default(vff_fiscal_existing_deploy_state.need_update_to_present | default(false)) | bool }}
+      deployment_status: success
+  when: not ansible_check_mode | bool
+
+- name: Update deploy state after successful service deployment
+  ansible.builtin.include_role:
+    name: vff_fiscal_common
+    tasks_from: write_deploy_state.yml
+  when: not ansible_check_mode | bool
+
+- name: Remove stale candidate compose file after check mode skip
+  ansible.builtin.file:
+    path: "{{ vff_fiscal_compose_path }}.new"
+    state: absent
+  when: ansible_check_mode | bool

@@ -1,0 +1,10 @@
+---
+- name: Deploy vff-fiscal service and SHM adapter
+  hosts: vff_fiscal
+  serial: 1
+  gather_facts: true
+  roles:
+    - role: vff_fiscal_common
+    - role: vff_fiscal_service
+    - role: vff_fiscal_adapter
+    - role: vff_fiscal_status

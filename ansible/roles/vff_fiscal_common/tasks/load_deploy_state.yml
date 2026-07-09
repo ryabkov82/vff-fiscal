@@ -1,0 +1,24 @@
+---
+- name: Check existing deploy state file
+  ansible.builtin.stat:
+    path: "{{ vff_fiscal_deploy_state_path }}"
+  register: vff_fiscal_existing_deploy_state_stat
+
+- name: Load existing deploy state when present
+  ansible.builtin.slurp:
+    src: "{{ vff_fiscal_deploy_state_path }}"
+  register: vff_fiscal_existing_deploy_state_raw
+  when: vff_fiscal_existing_deploy_state_stat.stat.exists | default(false)
+  no_log: true
+
+- name: Parse existing deploy state
+  ansible.builtin.set_fact:
+    vff_fiscal_existing_deploy_state: >-
+      {{ vff_fiscal_existing_deploy_state_raw.content | b64decode | from_json }}
+  when: vff_fiscal_existing_deploy_state_stat.stat.exists | default(false)
+  no_log: true
+
+- name: Default empty deploy state
+  ansible.builtin.set_fact:
+    vff_fiscal_existing_deploy_state: {}
+  when: not vff_fiscal_existing_deploy_state_stat.stat.exists | default(false)

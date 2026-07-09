@@ -2,3 +2,8 @@
 data/
 vff-fiscal
 *.log
+ansible/hosts.ini
+.ansible/
+*.retry
+__pycache__/
+*.pyc

@@ -1,0 +1,49 @@
+---
+vff_fiscal_repo_url: https://github.com/ryabkov82/vff-fiscal.git
+vff_fiscal_root: /opt/vff-fiscal
+vff_fiscal_app_dir: /opt/vff-fiscal/app
+vff_fiscal_env_file: /opt/vff-fiscal/.env
+vff_fiscal_data_dir: /opt/vff-fiscal/data
+vff_fiscal_state_path: /opt/vff-fiscal/data/state.json
+vff_fiscal_compose_path: /opt/vff-fiscal/docker-compose.yml
+vff_fiscal_backup_root: /opt/vff-fiscal/backups/releases
+vff_fiscal_deploy_state_path: /opt/vff-fiscal/deploy-state.json
+vff_fiscal_deploy_tools_dir: /opt/vff-fiscal/deploy-tools
+vff_fiscal_image_repository: vff-fiscal
+vff_fiscal_container_name: vff-fiscal
+vff_fiscal_host_port: 18080
+vff_fiscal_container_port: 8080
+vff_fiscal_docker_network: shm_default
+vff_fiscal_runtime_uid: 65532
+vff_fiscal_runtime_gid: 65532
+vff_fiscal_docker_build_pull: true
+vff_fiscal_git_default_ref: origin/main
+vff_fiscal_allow_unreachable_commit: false
+vff_fiscal_spool_quiet_retries: 60
+vff_fiscal_spool_quiet_delay: 5
+vff_fiscal_spool_gate_attempts: 5
+vff_fiscal_spool_gate_retry_delay: 2
+
+shm_root: /opt/shm
+shm_pay_systems_dir: /opt/shm/pay_systems
+shm_pay_systems_container_dir: /app/data/pay_systems
+shm_core_container: shm-core-1
+shm_spool_container: shm-spool-1
+shm_adapter_name: srv_customlab_nalog
+shm_adapter_path: /opt/shm/pay_systems/srv_customlab_nalog.cgi
+shm_adapter_container_path: "{{ shm_pay_systems_container_dir }}/srv_customlab_nalog.cgi"
+shm_adapter_lib_dir: /opt/shm/pay_systems/lib/VFFFiscal
+shm_adapter_lib_container_dir: "{{ shm_pay_systems_container_dir }}/lib/VFFFiscal"
+shm_adapter_owner: www-data
+shm_adapter_group: www-data
+shm_adapter_stage_dir: /opt/shm/pay_systems/.vff-fiscal-stage
+
+vff_fiscal_required_env_keys:
+  - VFF_FISCAL_API_KEY
+  - VFF_FISCAL_STATE_PATH
+  - LKNPD_INN
+  - LKNPD_REFRESH_TOKEN
+  - LKNPD_DEVICE_ID
+  - LKNPD_BASE_URL
+  - LKNPD_TIMEZONE_OFFSET
+  - LKNPD_PAYMENT_TYPE

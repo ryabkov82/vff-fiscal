@@ -1,0 +1,7 @@
+---
+- name: Report vff-fiscal deployment status
+  hosts: vff_fiscal
+  serial: 1
+  gather_facts: false
+  roles:
+    - role: vff_fiscal_status

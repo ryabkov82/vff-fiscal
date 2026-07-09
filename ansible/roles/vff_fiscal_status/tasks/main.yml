@@ -1,0 +1,114 @@
+---
+- name: Collect safe vff-fiscal deployment status
+  ansible.builtin.set_fact:
+    status_requested_version: "{{ vff_fiscal_version | default('') }}"
+
+- name: Read deploy state manifest
+  ansible.builtin.slurp:
+    src: "{{ vff_fiscal_deploy_state_path }}"
+  register: status_deploy_state_raw
+  failed_when: false
+  no_log: true
+
+- name: Parse deploy state manifest
+  ansible.builtin.set_fact:
+    status_deploy_state: >-
+      {{ (status_deploy_state_raw.content | b64decode | from_json)
+      if status_deploy_state_raw.content is defined else {} }}
+
+- name: Inspect running service container image
+  ansible.builtin.command: docker inspect -f '{{ "{{" }}.Config.Image{{ "}}" }}' {{ vff_fiscal_container_name }}
+  register: status_container_image_probe
+  changed_when: false
+  failed_when: false
+
+- name: Inspect running service container state
+  ansible.builtin.command: docker inspect -f '{{ "{{" }}.State.Running{{ "}}" }}' {{ vff_fiscal_container_name }}
+  register: status_container_running_probe
+  changed_when: false
+  failed_when: false
+
+- name: Inspect running service container health
+  ansible.builtin.command: docker inspect -f '{{ "{{" }}.State.Health.Status{{ "}}" }}' {{ vff_fiscal_container_name }}
+  register: status_container_health_probe
+  changed_when: false
+  failed_when: false
+
+- name: Parse running service container facts
+  ansible.builtin.set_fact:
+    status_running_image: >-
+      {{ status_container_image_probe.stdout if status_container_image_probe.rc == 0 else 'unknown' }}
+    status_container_running: >-
+      {{ status_container_running_probe.stdout if status_container_running_probe.rc == 0 else 'false' }}
+    status_container_health: >-
+      {{ status_container_health_probe.stdout if status_container_health_probe.rc == 0 else 'unknown' }}
+
+- name: Query health endpoint
+  ansible.builtin.uri:
+    url: http://127.0.0.1:{{ vff_fiscal_host_port }}/healthz
+    return_content: true
+  register: status_health
+  failed_when: false
+
+- name: Inspect active adapter CGI
+  ansible.builtin.stat:
+    path: "{{ shm_adapter_path }}"
+    checksum_algorithm: sha256
+  register: status_adapter_cgi
+
+- name: Check immutable flag on active adapter CGI
+  ansible.builtin.command: lsattr {{ shm_adapter_path }}
+  register: status_adapter_lsattr
+  changed_when: false
+  failed_when: false
+
+- name: Read SHM adapter safe status via stdin helper
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+      - status
+  environment:
+    SHM_CONTAINER: "{{ shm_core_container }}"
+    DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+    SHM_SCRIPT: shm-config.pl
+  register: status_adapter_config_raw
+  changed_when: false
+  failed_when: false
+
+- name: Parse SHM adapter safe status
+  ansible.builtin.set_fact:
+    status_adapter_config: >-
+      {{ status_adapter_config_raw.stdout | from_json
+      if status_adapter_config_raw.rc == 0 else {} }}
+
+- name: Run adapter diagnostic without action
+  ansible.builtin.command: docker exec {{ shm_core_container }} perl {{ shm_adapter_container_path }}
+  register: status_adapter_diag_raw
+  changed_when: false
+  failed_when: false
+
+- name: Parse adapter diagnostic message
+  ansible.builtin.set_fact:
+    status_adapter_diag: >-
+      {{ status_adapter_diag_raw.stdout | from_json
+      if status_adapter_diag_raw.rc == 0 else {} }}
+
+- name: Report safe deployment status
+  ansible.builtin.debug:
+    msg:
+      requested_service_commit: "{{ status_requested_version }}"
+      deployed_service_commit: "{{ status_deploy_state.service_commit | default('unknown') }}"
+      deployed_service_image: "{{ status_deploy_state.service_image | default('unknown') }}"
+      running_service_image: "{{ status_running_image }}"
+      container_running: "{{ status_container_running }}"
+      container_health: "{{ status_container_health }}"
+      healthz_status: "{{ status_health.status | default('unknown') }}"
+      deployed_adapter_commit: "{{ status_deploy_state.adapter_commit | default('unknown') }}"
+      active_adapter_sha256: "{{ status_adapter_cgi.stat.checksum | default('unknown') }}"
+      adapter_immutable: "{{ 'i' in (status_adapter_lsattr.stdout | default('')) }}"
+      adapter_diagnostic_message: "{{ status_adapter_diag.msg | default('unknown') }}"
+      adapter_enabled: "{{ status_adapter_config.enabled | default('unknown') }}"
+      need_update_to_defined: "{{ status_adapter_config.need_update_to_defined | default('unknown') }}"
+      client_token_present: "{{ status_adapter_config.client_token_present | default('unknown') }}"
+      deployment_status: "{{ status_deploy_state.deployment_status | default('unknown') }}"

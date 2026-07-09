@@ -1,0 +1,21 @@
+---
+- name: Wait until SHM spool has no active adapter CGI process
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/spool-quiet.py"
+  environment:
+    SPOOL_CONTAINER: "{{ shm_spool_container }}"
+    CGI_NAME: srv_customlab_nalog.cgi
+  register: vff_fiscal_spool_quiet_result
+  until: vff_fiscal_spool_quiet_result.rc == 0
+  retries: "{{ vff_fiscal_spool_quiet_retries }}"
+  delay: "{{ vff_fiscal_spool_quiet_delay }}"
+  changed_when: false
+
+- name: Fail when active adapter CGI process does not finish
+  ansible.builtin.fail:
+    msg: >-
+      SHM spool still has an active srv_customlab_nalog.cgi process after
+      {{ vff_fiscal_spool_quiet_retries }} checks.
+  when: vff_fiscal_spool_quiet_result.rc != 0

@@ -1,0 +1,12 @@
+---
+offline: true
+profile: production
+exclude_paths:
+  - .ansible/
+  - ansible/hosts.ini
+  - .git/
+  - data/
+write_list:
+  - yaml
+  - meta
+  - runtime

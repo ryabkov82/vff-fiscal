@@ -1,0 +1,40 @@
+---
+- name: Attempt restore immutable flag on adapter CGI
+  ansible.builtin.command: chattr +i {{ shm_adapter_path }}
+  changed_when: true
+  failed_when: false
+
+- name: Verify adapter CGI immutable flag
+  ansible.builtin.command: lsattr {{ shm_adapter_path }}
+  register: vff_fiscal_adapter_immutable_verify
+  changed_when: false
+  failed_when: false
+
+- name: Unpause SHM spool after immutable protection confirmed
+  ansible.builtin.command: docker unpause {{ shm_spool_container }}
+  changed_when: true
+  failed_when: false
+  when:
+    - vff_fiscal_spool_was_paused | default(false) | bool
+    - "'i' in (vff_fiscal_adapter_immutable_verify.stdout | default(''))"
+
+- name: Build immutable recovery message
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/immutable_recovery.py"
+  environment:
+    SPOOL_CONTAINER: "{{ shm_spool_container }}"
+    CGI_PATH: "{{ shm_adapter_path }}"
+    IMMUTABLE_OK: "{{ '1' if ('i' in (vff_fiscal_adapter_immutable_verify.stdout | default(''))) else '0' }}"
+    SPOOL_PAUSED: "{{ '1' if vff_fiscal_spool_was_paused | default(false) | bool else '0' }}"
+  register: vff_fiscal_immutable_recovery_message
+  changed_when: false
+  failed_when: false
+
+- name: Fail closed when immutable protection cannot be verified
+  ansible.builtin.fail:
+    msg: "{{ vff_fiscal_immutable_recovery_message.stdout }}"
+  when:
+    - vff_fiscal_spool_was_paused | default(false) | bool
+    - "'i' not in (vff_fiscal_adapter_immutable_verify.stdout | default(''))"

@@ -1,0 +1,12 @@
+---
+- name: Run SHM config helper via stdin
+  ansible.builtin.command:
+    argv: "{{ ['python3', vff_fiscal_deploy_tools_dir + '/run_shm_perl.py'] + (vff_fiscal_shm_config_args | default(['status'])) }}"
+  environment:
+    SHM_CONTAINER: "{{ shm_core_container }}"
+    DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+    SHM_SCRIPT: shm-config.pl
+  register: vff_fiscal_shm_config_result
+  changed_when: vff_fiscal_shm_config_mark_changed | default(false) | bool
+  failed_when: vff_fiscal_shm_config_result.rc != 0
+  no_log: "{{ vff_fiscal_shm_config_no_log | default(false) | bool }}"

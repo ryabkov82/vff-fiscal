@@ -1,0 +1,148 @@
+---
+- name: Validate rollback backup directory variable
+  ansible.builtin.assert:
+    that:
+      - vff_fiscal_rollback_backup_dir is defined
+      - vff_fiscal_rollback_backup_dir is string
+      - vff_fiscal_rollback_backup_dir is match('^/opt/vff-fiscal/backups/releases/.+/service/?$')
+    fail_msg: vff_fiscal_rollback_backup_dir must point to a service backup under /opt/vff-fiscal/backups/releases/.
+
+- name: Require explicit rollback confirmation
+  ansible.builtin.assert:
+    that:
+      - vff_fiscal_rollback_confirm | default(false) | bool
+    fail_msg: Set vff_fiscal_rollback_confirm=true to run service rollback.
+
+- name: Initialize service rollback facts
+  ansible.builtin.set_fact:
+    vff_fiscal_spool_was_paused: false
+    service_rollback_backup_dir: "{{ vff_fiscal_rollback_backup_dir | regex_replace('/$', '') }}"
+
+- name: Read service rollback metadata
+  ansible.builtin.slurp:
+    src: "{{ service_rollback_backup_dir }}/backup-meta.json"
+  register: service_rollback_meta_raw
+
+- name: Parse service rollback metadata
+  ansible.builtin.set_fact:
+    service_rollback_meta: "{{ service_rollback_meta_raw.content | b64decode | from_json }}"
+
+- name: Determine rollback image tag
+  ansible.builtin.set_fact:
+    service_rollback_image: >-
+      {{ service_rollback_meta.rollback_image
+      | default(service_rollback_meta.image | default('')) }}
+
+- name: Validate rollback image exists locally
+  ansible.builtin.command: docker image inspect {{ service_rollback_image }}
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Restore previous compose file from backup
+  ansible.builtin.copy:
+    src: "{{ service_rollback_backup_dir }}/docker-compose.yml"
+    dest: "{{ vff_fiscal_compose_path }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0600"
+  when: not ansible_check_mode | bool
+
+- name: Validate restored compose file
+  ansible.builtin.command: docker compose -f {{ vff_fiscal_compose_path }} config -q
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Service rollback cutover block
+  when: not ansible_check_mode | bool
+  block:
+    - name: Acquire SHM spool cutover gate before service rollback
+      ansible.builtin.include_role:
+        name: vff_fiscal_common
+        tasks_from: spool_cutover_gate.yml
+
+    - name: Re-check state for creating receipts after spool pause
+      ansible.builtin.include_role:
+        name: vff_fiscal_common
+        tasks_from: assert_no_creating_receipts.yml
+
+    - name: Back up current state file before service rollback
+      ansible.builtin.copy:
+        src: "{{ vff_fiscal_state_path }}"
+        dest: "{{ service_rollback_backup_dir }}/pre-rollback-state.json"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Start rollback service from restored compose file
+      ansible.builtin.command: >-
+        docker compose -f {{ vff_fiscal_compose_path }}
+        up -d --no-deps --pull never {{ vff_fiscal_container_name }}
+      changed_when: true
+
+    - name: Wait for rollback health endpoint
+      ansible.builtin.uri:
+        url: http://127.0.0.1:{{ vff_fiscal_host_port }}/healthz
+        return_content: true
+      register: service_rollback_health
+      until: service_rollback_health.status == 200 and (service_rollback_health.json.status | default('')) == 'ok'
+      retries: 12
+      delay: 5
+
+    - name: Authenticated user smoke test after service rollback
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/auth-smoke.py"
+      environment:
+        ENV_FILE: "{{ vff_fiscal_env_file }}"
+        USER_URL: http://127.0.0.1:{{ vff_fiscal_host_port }}/v1/user
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+  always:
+    - name: Unpause SHM spool after service rollback
+      ansible.builtin.include_role:
+        name: vff_fiscal_common
+        tasks_from: unpause_spool.yml
+
+- name: Load existing deploy manifest
+  ansible.builtin.include_role:
+    name: vff_fiscal_common
+    tasks_from: load_deploy_state.yml
+  when: not ansible_check_mode | bool
+
+- name: Read rollback image ID
+  ansible.builtin.command: docker image inspect -f '{{ "{{" }}.Id{{ "}}" }}' {{ service_rollback_image }}
+  register: service_rollback_image_id
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Write deploy state after service rollback
+  ansible.builtin.include_role:
+    name: vff_fiscal_common
+    tasks_from: write_deploy_state.yml
+  vars:
+    vff_fiscal_common_manifest:
+      service_commit: "{{ service_rollback_meta.commit | default(vff_fiscal_existing_deploy_state.service_commit | default('')) }}"
+      service_image: "{{ service_rollback_image }}"
+      service_image_id: "{{ service_rollback_image_id.stdout | default('') }}"
+      deployed_at: "{{ ansible_date_time.iso8601 }}"
+      backup_directory: "{{ service_rollback_backup_dir }}"
+      previous_service_image: "{{ vff_fiscal_existing_deploy_state.service_image | default('') }}"
+      previous_service_image_id: "{{ vff_fiscal_existing_deploy_state.service_image_id | default('') }}"
+      adapter_commit: "{{ vff_fiscal_existing_deploy_state.adapter_commit | default('') }}"
+      adapter_sha256: "{{ vff_fiscal_existing_deploy_state.adapter_sha256 | default('') }}"
+      adapter_enabled: "{{ vff_fiscal_existing_deploy_state.adapter_enabled | default(false) | bool }}"
+      need_update_to_present: "{{ vff_fiscal_existing_deploy_state.need_update_to_present | default(false) | bool }}"
+      deployment_status: service_rollback
+  when: not ansible_check_mode | bool
+
+- name: Report service rollback result
+  ansible.builtin.debug:
+    msg: >-
+      Service rollback completed from {{ service_rollback_backup_dir }}.
+      state.json was intentionally not restored.

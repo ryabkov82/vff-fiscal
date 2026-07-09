@@ -195,3 +195,18 @@ make fmt
 make test
 make build
 ```
+
+## Deployment
+
+Production deployment is manual and Ansible-driven. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
+Quick examples:
+
+```bash
+cp ansible/hosts.ini.example ansible/hosts.ini
+make verify
+make deploy HOST=vff-fiscal VERSION=<40-char-sha>
+make deploy-status HOST=vff-fiscal
+```
+
+Never commit `ansible/hosts.ini`, `.env`, or `data/state.json`.

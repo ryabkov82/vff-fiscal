@@ -1,0 +1,20 @@
+---
+- name: Assert state has no creating receipts
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/inspect-state.py"
+  environment:
+    STATE_FILE: "{{ vff_fiscal_state_path }}"
+    BLOCK_CREATING: "1"
+  register: vff_fiscal_state_inspect
+  changed_when: false
+  failed_when: vff_fiscal_state_inspect.rc != 0
+  no_log: true
+
+- name: Report blocked creating receipts count
+  ansible.builtin.debug:
+    msg: >-
+      Cutover blocked because {{ vff_fiscal_state_inspect.stdout_lines
+      | select('match', '^creating_count=') | first | default('creating_count=unknown') }}.
+  when: vff_fiscal_state_inspect.rc != 0

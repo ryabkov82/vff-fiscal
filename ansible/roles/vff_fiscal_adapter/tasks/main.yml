@@ -1,0 +1,655 @@
+---
+- name: Initialize adapter deployment facts
+  ansible.builtin.set_fact:
+    adapter_backup_dir: "{{ vff_fiscal_backup_root }}/{{ deploy_timestamp }}-{{ deploy_short_sha }}/adapter"
+    adapter_stage_dir: "{{ shm_adapter_stage_dir }}/{{ vff_fiscal_version }}"
+    adapter_stage_container_dir: "{{ shm_pay_systems_container_dir }}/.vff-fiscal-stage/{{ vff_fiscal_version }}"
+    adapter_cutover_required: true
+    adapter_active_modified: false
+    adapter_pristine_enabled: false
+    adapter_pristine_status: {}
+    vff_fiscal_spool_was_paused: false
+
+- name: Install adapter deployment helper scripts on host
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ vff_fiscal_deploy_tools_dir }}/{{ item }}"
+    mode: "0750"
+    owner: root
+    group: root
+  loop:
+    - shm-config.pl
+    - shm-auth-smoke.pl
+  when: not ansible_check_mode | bool
+
+- name: Verify SHM stdin execution preflight
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/shm_exec_preflight.py"
+  environment:
+    SHM_CONTAINER: "{{ shm_core_container }}"
+    SHM_PAY_SYSTEMS_CONTAINER_DIR: "{{ shm_pay_systems_container_dir }}"
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Verify adapter source files exist in checkout
+  ansible.builtin.stat:
+    path: "{{ vff_fiscal_app_dir }}/{{ item }}"
+  register: adapter_source_stats
+  loop:
+    - adapters/shm/srv_customlab_nalog.cgi
+    - adapters/shm/lib/VFFFiscal/AdapterConfig.pm
+    - adapters/shm/lib/VFFFiscal/PaymentTimestamp.pm
+
+- name: Require adapter source files
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+    fail_msg: Missing adapter source file {{ item.item }}
+  loop: "{{ adapter_source_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Verify SHM pay-systems directory exists on host
+  ansible.builtin.stat:
+    path: "{{ shm_pay_systems_dir }}"
+  register: shm_pay_systems_stat
+
+- name: Require SHM pay-systems directory on host
+  ansible.builtin.assert:
+    that:
+      - shm_pay_systems_stat.stat.exists
+      - shm_pay_systems_stat.stat.isdir
+    fail_msg: "{{ shm_pay_systems_dir }} must exist."
+
+- name: Verify pay-systems path inside SHM core container
+  ansible.builtin.command: docker exec {{ shm_core_container }} test -d {{ shm_pay_systems_container_dir }}
+  changed_when: false
+
+- name: Verify pay-systems path inside SHM spool container
+  ansible.builtin.command: docker exec {{ shm_spool_container }} test -d {{ shm_pay_systems_container_dir }}
+  changed_when: false
+
+- name: Read current SHM adapter status via stdin helper
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+      - status
+  environment:
+    SHM_CONTAINER: "{{ shm_core_container }}"
+    DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+    SHM_SCRIPT: shm-config.pl
+  register: adapter_status_before_raw
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Parse current SHM adapter status
+  ansible.builtin.set_fact:
+    adapter_pristine_status: "{{ adapter_status_before_raw.stdout | from_json }}"
+    adapter_pristine_enabled: "{{ adapter_status_before_raw.stdout | from_json | json_query('enabled') }}"
+  when: not ansible_check_mode | bool
+
+- name: Require client_token in SHM configuration
+  ansible.builtin.assert:
+    that:
+      - adapter_pristine_status.client_token_present | default(false) | bool
+    fail_msg: SHM client_token must be configured before adapter deployment.
+  when: not ansible_check_mode | bool
+
+- name: Create adapter staging directory on host
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ shm_adapter_owner }}"
+    group: "{{ shm_adapter_group }}"
+    mode: "0755"
+  loop:
+    - "{{ adapter_stage_dir }}"
+    - "{{ adapter_stage_dir }}/lib/VFFFiscal"
+  when: not ansible_check_mode | bool
+
+- name: Stage adapter CGI and helper modules on host
+  ansible.builtin.copy:
+    src: "{{ vff_fiscal_app_dir }}/{{ item.src }}"
+    dest: "{{ adapter_stage_dir }}/{{ item.dest }}"
+    owner: "{{ shm_adapter_owner }}"
+    group: "{{ shm_adapter_group }}"
+    mode: "{{ item.mode }}"
+    remote_src: true
+  loop:
+    - { src: adapters/shm/srv_customlab_nalog.cgi, dest: srv_customlab_nalog.cgi, mode: "0755" }
+    - { src: adapters/shm/lib/VFFFiscal/AdapterConfig.pm, dest: lib/VFFFiscal/AdapterConfig.pm, mode: "0644" }
+    - { src: adapters/shm/lib/VFFFiscal/PaymentTimestamp.pm, dest: lib/VFFFiscal/PaymentTimestamp.pm, mode: "0644" }
+  when: not ansible_check_mode | bool
+
+- name: Compile staged adapter CGI in SHM core container
+  ansible.builtin.command: docker exec {{ shm_core_container }} perl -c {{ adapter_stage_container_dir }}/srv_customlab_nalog.cgi
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Compile staged adapter CGI in SHM spool container
+  ansible.builtin.command: docker exec {{ shm_spool_container }} perl -c {{ adapter_stage_container_dir }}/srv_customlab_nalog.cgi
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Compile staged helper modules in SHM core container
+  ansible.builtin.command: docker exec {{ shm_core_container }} perl -c {{ adapter_stage_container_dir }}/lib/VFFFiscal/{{ item }}
+  loop:
+    - AdapterConfig.pm
+    - PaymentTimestamp.pm
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Compile staged helper modules in SHM spool container
+  ansible.builtin.command: docker exec {{ shm_spool_container }} perl -c {{ adapter_stage_container_dir }}/lib/VFFFiscal/{{ item }}
+  loop:
+    - AdapterConfig.pm
+    - PaymentTimestamp.pm
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Record staged adapter checksums
+  ansible.builtin.stat:
+    path: "{{ adapter_stage_dir }}/{{ item.path }}"
+    checksum_algorithm: sha256
+  register: adapter_stage_checksums
+  loop:
+    - { path: srv_customlab_nalog.cgi, key: cgi }
+    - { path: lib/VFFFiscal/AdapterConfig.pm, key: AdapterConfig.pm }
+    - { path: lib/VFFFiscal/PaymentTimestamp.pm, key: PaymentTimestamp.pm }
+  when: not ansible_check_mode | bool
+
+- name: Check active adapter file checksums for idempotency
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    checksum_algorithm: sha256
+  register: adapter_active_file_stats
+  loop:
+    - { path: "{{ shm_adapter_path }}", key: cgi }
+    - { path: "{{ shm_adapter_lib_dir }}/AdapterConfig.pm", key: AdapterConfig.pm }
+    - { path: "{{ shm_adapter_lib_dir }}/PaymentTimestamp.pm", key: PaymentTimestamp.pm }
+  when: not ansible_check_mode | bool
+
+- name: Check immutable flag on active adapter CGI
+  ansible.builtin.command: lsattr {{ shm_adapter_path }}
+  register: adapter_idempotency_lsattr
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Run adapter diagnostic for idempotency check
+  ansible.builtin.command: docker exec {{ shm_core_container }} perl {{ shm_adapter_container_path }}
+  register: adapter_idempotency_diag_raw
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Evaluate adapter deployment idempotency
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/adapter_idempotency.py"
+  environment:
+    STAGED_CGI_SHA256: "{{ adapter_stage_checksums.results[0].stat.checksum | default('') }}"
+    STAGED_ADAPTER_CONFIG_SHA256: "{{ adapter_stage_checksums.results[1].stat.checksum | default('') }}"
+    STAGED_PAYMENT_TIMESTAMP_SHA256: "{{ adapter_stage_checksums.results[2].stat.checksum | default('') }}"
+    ACTIVE_CGI_SHA256: "{{ adapter_active_file_stats.results[0].stat.checksum | default('') }}"
+    ACTIVE_ADAPTER_CONFIG_SHA256: "{{ adapter_active_file_stats.results[1].stat.checksum | default('') }}"
+    ACTIVE_PAYMENT_TIMESTAMP_SHA256: "{{ adapter_active_file_stats.results[2].stat.checksum | default('') }}"
+    ADAPTER_IMMUTABLE: "{{ '1' if ('i' in (adapter_idempotency_lsattr.stdout | default(''))) else '0' }}"
+    SHM_STATUS_JSON: "{{ adapter_pristine_status | to_json }}"
+    DIAGNOSTIC_OK: >-
+      {{ '1' if (
+        adapter_idempotency_diag_raw.rc == 0
+        and (adapter_idempotency_diag_raw.stdout | from_json).status | default(0) == 200
+        and (adapter_idempotency_diag_raw.stdout | from_json).msg | default('') == 'VFF Fiscal SHM adapter'
+      ) else '0' }}
+  register: adapter_idempotency_eval
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Decide whether adapter cutover is required
+  ansible.builtin.set_fact:
+    adapter_cutover_required: >-
+      {{ not (adapter_idempotency_eval.stdout_lines
+      | select('match', '^skip_cutover=1') | list | length > 0) }}
+  when: not ansible_check_mode | bool
+
+- name: Report idempotent adapter deployment skip
+  ansible.builtin.debug:
+    msg: >-
+      Active adapter files, immutable protection, need_update_to, and diagnostics
+      already match staged repository content. Skipping cutover.
+  when:
+    - not ansible_check_mode | bool
+    - not adapter_cutover_required | bool
+
+- name: Adapter cutover block
+  when:
+    - not ansible_check_mode | bool
+    - adapter_cutover_required | bool
+  block:
+    - name: Acquire SHM spool cutover gate before adapter cutover
+      ansible.builtin.include_role:
+        name: vff_fiscal_common
+        tasks_from: spool_cutover_gate.yml
+
+    - name: Create adapter backup directory
+      ansible.builtin.file:
+        path: "{{ adapter_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Back up active adapter CGI
+      ansible.builtin.copy:
+        src: "{{ shm_adapter_path }}"
+        dest: "{{ adapter_backup_dir }}/srv_customlab_nalog.cgi"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0700"
+      when: adapter_active_file_stats.results[0].stat.exists | default(false)
+
+    - name: Back up active adapter helper directory
+      ansible.builtin.command: cp -a {{ shm_adapter_lib_dir }} {{ adapter_backup_dir }}/lib-VFFFiscal
+      changed_when: true
+      when: adapter_active_file_stats.results[0].stat.exists | default(false)
+
+    - name: Back up adapter immutable flag state
+      ansible.builtin.copy:
+        dest: "{{ adapter_backup_dir }}/cgi-lsattr.txt"
+        content: "{{ adapter_idempotency_lsattr.stdout | default('') }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: adapter_active_file_stats.results[0].stat.exists | default(false)
+
+    - name: Write safe SHM adapter status backup
+      ansible.builtin.copy:
+        dest: "{{ adapter_backup_dir }}/shm-status.json"
+        content: "{{ adapter_pristine_status | to_nice_json }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Prepare adapter backup metadata
+      ansible.builtin.set_fact:
+        adapter_backup_metadata:
+          component: adapter
+          commit: "{{ vff_fiscal_version }}"
+          backup_directory: "{{ adapter_backup_dir }}"
+          enabled: "{{ adapter_pristine_enabled }}"
+          deployed_at: "{{ ansible_date_time.iso8601 }}"
+          file_checksums:
+            cgi: "{{ adapter_active_file_stats.results[0].stat.checksum | default('') }}"
+            AdapterConfig.pm: "{{ adapter_active_file_stats.results[1].stat.checksum | default('') }}"
+            PaymentTimestamp.pm: "{{ adapter_active_file_stats.results[2].stat.checksum | default('') }}"
+
+    - name: Write adapter backup metadata
+      ansible.builtin.copy:
+        dest: "{{ adapter_backup_dir }}/backup-meta.json"
+        owner: root
+        group: root
+        mode: "0600"
+        content: "{{ adapter_backup_metadata | to_nice_json }}"
+
+    - name: Clear SHM need_update_to marker via stdin helper
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+          - clear-update-marker
+      environment:
+        SHM_CONTAINER: "{{ shm_core_container }}"
+        DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+        SHM_SCRIPT: shm-config.pl
+      changed_when: true
+
+    - name: Verify need_update_to remains cleared
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+          - status
+      environment:
+        SHM_CONTAINER: "{{ shm_core_container }}"
+        DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+        SHM_SCRIPT: shm-config.pl
+      register: adapter_need_update_check
+      changed_when: false
+
+    - name: Assert need_update_to remains cleared
+      ansible.builtin.assert:
+        that:
+          - not (adapter_need_update_check.stdout | from_json | json_query('need_update_to_defined') | bool)
+        fail_msg: need_update_to is still defined after clear-update-marker.
+
+    - name: Remove immutable flag from active adapter CGI
+      ansible.builtin.command: chattr -i {{ shm_adapter_path }}
+      changed_when: true
+      failed_when: false
+      when: adapter_active_file_stats.results[0].stat.exists | default(false)
+
+    - name: Ensure active adapter helper directory exists
+      ansible.builtin.file:
+        path: "{{ shm_adapter_lib_dir }}"
+        state: directory
+        owner: "{{ shm_adapter_owner }}"
+        group: "{{ shm_adapter_group }}"
+        mode: "0755"
+
+    - name: Install helper modules atomically
+      ansible.builtin.shell: |
+        set -euo pipefail
+        install -o {{ shm_adapter_owner }} -g {{ shm_adapter_group }} -m 0644 \
+          {{ adapter_stage_dir }}/lib/VFFFiscal/{{ item }} \
+          {{ shm_adapter_lib_dir }}/{{ item }}.new
+        mv {{ shm_adapter_lib_dir }}/{{ item }}.new {{ shm_adapter_lib_dir }}/{{ item }}
+      args:
+        executable: /bin/bash
+      loop:
+        - AdapterConfig.pm
+        - PaymentTimestamp.pm
+      changed_when: true
+
+    - name: Install adapter CGI atomically
+      ansible.builtin.shell: |
+        set -euo pipefail
+        install -o {{ shm_adapter_owner }} -g {{ shm_adapter_group }} -m 0755 \
+          {{ adapter_stage_dir }}/srv_customlab_nalog.cgi \
+          {{ shm_adapter_path }}.new
+        mv {{ shm_adapter_path }}.new {{ shm_adapter_path }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Mark adapter active files as modified
+      ansible.builtin.set_fact:
+        adapter_active_modified: true
+
+    - name: Compile installed adapter CGI in SHM core container
+      ansible.builtin.command: docker exec {{ shm_core_container }} perl -c {{ shm_adapter_container_path }}
+      changed_when: false
+
+    - name: Compile installed adapter CGI in SHM spool container
+      ansible.builtin.command: docker exec {{ shm_spool_container }} perl -c {{ shm_adapter_container_path }}
+      changed_when: false
+
+    - name: Compile installed helper modules in SHM core container
+      ansible.builtin.command: docker exec {{ shm_core_container }} perl -c {{ shm_adapter_lib_container_dir }}/{{ item }}
+      loop:
+        - AdapterConfig.pm
+        - PaymentTimestamp.pm
+      changed_when: false
+
+    - name: Compile installed helper modules in SHM spool container
+      ansible.builtin.command: docker exec {{ shm_spool_container }} perl -c {{ shm_adapter_lib_container_dir }}/{{ item }}
+      loop:
+        - AdapterConfig.pm
+        - PaymentTimestamp.pm
+      changed_when: false
+
+    - name: Restore adapter enabled setting unless explicitly overridden
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+          - set-enabled
+          - "{{ (vff_fiscal_adapter_enabled if vff_fiscal_adapter_enabled is defined else adapter_pristine_enabled) | bool | ternary('1', '0') }}"
+      environment:
+        SHM_CONTAINER: "{{ shm_core_container }}"
+        DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+        SHM_SCRIPT: shm-config.pl
+      changed_when: true
+
+    - name: Restore immutable flag on active adapter CGI
+      ansible.builtin.command: chattr +i {{ shm_adapter_path }}
+      changed_when: true
+
+    - name: Verify immutable flag on active adapter CGI
+      ansible.builtin.command: lsattr {{ shm_adapter_path }}
+      register: adapter_lsattr
+      changed_when: false
+      failed_when: "'i' not in adapter_lsattr.stdout"
+
+    - name: Verify active adapter CGI checksum
+      ansible.builtin.stat:
+        path: "{{ shm_adapter_path }}"
+        checksum_algorithm: sha256
+      register: adapter_active_cgi_checksum
+
+    - name: Assert active adapter CGI checksum matches staged source
+      ansible.builtin.assert:
+        that:
+          - adapter_active_cgi_checksum.stat.checksum == adapter_stage_checksums.results[0].stat.checksum
+        fail_msg: Active adapter CGI checksum does not match staged source.
+
+    - name: Verify active helper module checksums
+      ansible.builtin.stat:
+        path: "{{ shm_adapter_lib_dir }}/{{ item.name }}"
+        checksum_algorithm: sha256
+      register: adapter_active_module_checksum
+      loop:
+        - { name: AdapterConfig.pm, index: 1 }
+        - { name: PaymentTimestamp.pm, index: 2 }
+
+    - name: Assert active helper module checksums match staged source
+      ansible.builtin.assert:
+        that:
+          - item.stat.checksum == adapter_stage_checksums.results[item.index].stat.checksum
+        fail_msg: Active helper module checksum mismatch for {{ item.item.name }}.
+      loop: "{{ adapter_active_module_checksum.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Run adapter diagnostic without action
+      ansible.builtin.command: docker exec {{ shm_core_container }} perl {{ shm_adapter_container_path }}
+      register: adapter_diag_raw
+      changed_when: false
+
+    - name: Parse adapter diagnostic response
+      ansible.builtin.set_fact:
+        adapter_diag: "{{ adapter_diag_raw.stdout | from_json }}"
+
+    - name: Assert adapter diagnostic response
+      ansible.builtin.assert:
+        that:
+          - adapter_diag.status == 200
+          - adapter_diag.msg == 'VFF Fiscal SHM adapter'
+        fail_msg: Adapter diagnostic response did not match expected safe output.
+
+    - name: Run adapter missing-payment smoke test from spool container
+      ansible.builtin.command: >-
+        docker exec {{ shm_spool_container }}
+        perl {{ shm_adapter_container_path }} action=send pay_id=999999999999
+      register: adapter_missing_payment_raw
+      changed_when: false
+
+    - name: Parse adapter missing-payment smoke test response
+      ansible.builtin.set_fact:
+        adapter_missing_payment: "{{ adapter_missing_payment_raw.stdout | from_json }}"
+
+    - name: Assert adapter missing-payment smoke test response
+      ansible.builtin.assert:
+        that:
+          - adapter_missing_payment.status == 404
+          - adapter_missing_payment.msg == 'Payment not found: 999999999999'
+        fail_msg: Adapter missing-payment smoke test failed.
+
+    - name: Run adapter authenticated user smoke test via stdin helper
+      ansible.builtin.include_role:
+        name: vff_fiscal_common
+        tasks_from: run_shm_auth_smoke.yml
+
+    - name: Assert adapter authenticated user smoke test result
+      ansible.builtin.assert:
+        that:
+          - vff_fiscal_shm_auth_smoke_result.rc == 0
+        fail_msg: Adapter authenticated user smoke test failed.
+
+    - name: Re-read SHM adapter status after deployment
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+          - status
+      environment:
+        SHM_CONTAINER: "{{ shm_core_container }}"
+        DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+        SHM_SCRIPT: shm-config.pl
+      register: adapter_status_after_raw
+      changed_when: false
+
+    - name: Parse SHM adapter status after deployment
+      ansible.builtin.set_fact:
+        adapter_status_after: "{{ adapter_status_after_raw.stdout | from_json }}"
+
+    - name: Assert SHM adapter status after deployment
+      ansible.builtin.assert:
+        that:
+          - not (adapter_status_after.need_update_to_defined | default(true) | bool)
+          - adapter_status_after.client_token_present | bool
+        fail_msg: SHM adapter status verification failed after deployment.
+
+  rescue:
+    - name: Remove immutable flag before adapter restoration
+      ansible.builtin.command: chattr -i {{ shm_adapter_path }}
+      changed_when: true
+      failed_when: false
+      when: adapter_active_modified | default(false) | bool
+
+    - name: Restore backed-up adapter CGI
+      ansible.builtin.copy:
+        src: "{{ adapter_backup_dir }}/srv_customlab_nalog.cgi"
+        dest: "{{ shm_adapter_path }}"
+        remote_src: true
+        owner: "{{ shm_adapter_owner }}"
+        group: "{{ shm_adapter_group }}"
+        mode: "0755"
+      when: adapter_active_modified | default(false) | bool
+
+    - name: Restore backed-up adapter helper directory
+      ansible.builtin.shell: |
+        set -euo pipefail
+        rm -rf {{ shm_adapter_lib_dir }}
+        cp -a {{ adapter_backup_dir }}/lib-VFFFiscal {{ shm_adapter_lib_dir }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when: adapter_active_modified | default(false) | bool
+
+    - name: Preserve pre-deployment enabled value after adapter rollback
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+          - set-enabled
+          - "{{ adapter_pristine_enabled | bool | ternary('1', '0') }}"
+      environment:
+        SHM_CONTAINER: "{{ shm_core_container }}"
+        DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+        SHM_SCRIPT: shm-config.pl
+      changed_when: true
+      when: adapter_active_modified | default(false) | bool
+
+    - name: Ensure need_update_to remains cleared after adapter rollback
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+          - clear-update-marker
+      environment:
+        SHM_CONTAINER: "{{ shm_core_container }}"
+        DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+        SHM_SCRIPT: shm-config.pl
+      changed_when: true
+      when: adapter_active_modified | default(false) | bool
+
+    - name: Fail play after automatic adapter rollback
+      ansible.builtin.fail:
+        msg: >-
+          Adapter deployment failed and active files were restored from {{ adapter_backup_dir }}.
+          need_update_to was kept cleared and state.json was not modified.
+
+  always:
+    - name: Finalize adapter immutable protection and spool state
+      ansible.builtin.include_role:
+        name: vff_fiscal_common
+        tasks_from: finalize_adapter_immutable.yml
+
+- name: Load existing deploy manifest
+  ansible.builtin.include_role:
+    name: vff_fiscal_common
+    tasks_from: load_deploy_state.yml
+  when: not ansible_check_mode | bool
+
+- name: Read final SHM adapter status for manifest
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+      - status
+  environment:
+    SHM_CONTAINER: "{{ shm_core_container }}"
+    DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+    SHM_SCRIPT: shm-config.pl
+  register: adapter_manifest_status_raw
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Parse final SHM adapter status for manifest
+  ansible.builtin.set_fact:
+    adapter_manifest_status: "{{ adapter_manifest_status_raw.stdout | from_json }}"
+  when:
+    - not ansible_check_mode | bool
+    - adapter_manifest_status_raw.rc == 0
+
+- name: Default final SHM adapter status for manifest
+  ansible.builtin.set_fact:
+    adapter_manifest_status: {}
+  when:
+    - not ansible_check_mode | bool
+    - adapter_manifest_status_raw.rc != 0
+
+- name: Read active adapter CGI checksum for manifest
+  ansible.builtin.stat:
+    path: "{{ shm_adapter_path }}"
+    checksum_algorithm: sha256
+  register: adapter_manifest_cgi_stat
+  when: not ansible_check_mode | bool
+
+- name: Prepare adapter deploy manifest
+  ansible.builtin.set_fact:
+    vff_fiscal_common_manifest:
+      service_commit: "{{ vff_fiscal_existing_deploy_state.service_commit | default('') }}"
+      service_image: "{{ vff_fiscal_existing_deploy_state.service_image | default('') }}"
+      service_image_id: "{{ vff_fiscal_existing_deploy_state.service_image_id | default('') }}"
+      previous_service_image: "{{ vff_fiscal_existing_deploy_state.previous_service_image | default('') }}"
+      previous_service_image_id: "{{ vff_fiscal_existing_deploy_state.previous_service_image_id | default('') }}"
+      adapter_commit: "{{ vff_fiscal_version }}"
+      adapter_sha256: "{{ adapter_manifest_cgi_stat.stat.checksum | default('') }}"
+      deployed_at: "{{ ansible_date_time.iso8601 }}"
+      backup_directory: >-
+        {{ adapter_backup_dir if adapter_cutover_required | bool
+        else vff_fiscal_existing_deploy_state.backup_directory | default('') }}
+      adapter_enabled: >-
+        {{ adapter_manifest_status.enabled
+        | default(vff_fiscal_existing_deploy_state.adapter_enabled | default(false)) | bool }}
+      need_update_to_present: >-
+        {{ adapter_manifest_status.need_update_to_defined
+        | default(vff_fiscal_existing_deploy_state.need_update_to_present | default(false)) | bool }}
+      deployment_status: success
+  when: not ansible_check_mode | bool
+
+- name: Update deploy state after successful adapter deployment
+  ansible.builtin.include_role:
+    name: vff_fiscal_common
+    tasks_from: write_deploy_state.yml
+  when: not ansible_check_mode | bool
