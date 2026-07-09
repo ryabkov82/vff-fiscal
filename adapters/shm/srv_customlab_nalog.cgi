@@ -11,6 +11,7 @@ use Core::Utils qw(parse_headers encode_json decode_json now);
 use LWP::UserAgent ();
 use HTTP::Request ();
 use SHM qw(:all);
+use VFFFiscal::AdapterConfig qw(resolve_api_token);
 use VFFFiscal::PaymentTimestamp qw(extract_operation_time);
 
 our %ARGS = parse_args();
@@ -29,12 +30,15 @@ my %config = $all_config->{$module_name} ? %{ $all_config->{$module_name} } : ()
 my $enabled = $config{enabled};
 my $backend_url = $config{backend_url} || 'http://vff-fiscal:8080/v1/receipts';
 my $service_name = $config{service_name} || 'Услуга доступа к VPN-сервису VPN for Friends';
-my $api_token = $ENV{VFF_FISCAL_API_TOKEN} || '';
+my $api_token = resolve_api_token(
+    $config{client_token},
+    $ENV{VFF_FISCAL_API_TOKEN},
+);
 my $pay_systems = $config{pay_systems};
 my @allowed_pay_systems = ref $pay_systems eq 'ARRAY' ? @$pay_systems : ($pay_systems ? ($pay_systems) : ());
 
-unless ($api_token) {
-    print_json({ status => 500, msg => 'Error: VFF_FISCAL_API_TOKEN is not configured' });
+unless (defined $api_token && length $api_token) {
+    print_json({ status => 500, msg => 'Error: client_token or VFF_FISCAL_API_TOKEN is not configured' });
     exit;
 }
 

@@ -114,20 +114,31 @@ install -o www-data -g www-data -m 0755 \
   /opt/shm/pay_systems/srv_customlab_nalog.cgi
 ```
 
-Add the same API key to both `shm-core-1` and `shm-spool-1` as environment variable:
+Configure the SHM adapter API key in the module settings form as **Client Token** (`client_token`). Its value must equal `VFF_FISCAL_API_KEY` configured in vff-fiscal. When `client_token` is set through the SHM UI, no SHM container recreation is required.
+
+`VFF_FISCAL_API_TOKEN` remains an optional fallback for environment-only deployments. Add it to both `shm-core-1` and `shm-spool-1` only if you are not using `client_token`:
 
 ```text
 VFF_FISCAL_API_TOKEN=<same value as VFF_FISCAL_API_KEY>
 ```
 
+Token precedence in the adapter:
+
+1. non-empty `client_token` from SHM module configuration
+2. non-empty `VFF_FISCAL_API_TOKEN` environment variable
+3. configuration error
+
 The existing SHM settings form can still control:
 
 - Enabled
+- Client Token (`client_token`)
 - Service name
 - Payment systems
 - `backend_url` if added directly to configuration
 
-The fake Customlab refresh token is not used by the replacement adapter and should be removed from SHM configuration.
+The old Customlab integration fields for INN, Refresh Token, and time zone are not used by the new adapter. `LKNPD_INN`, `LKNPD_REFRESH_TOKEN`, `LKNPD_DEVICE_ID`, and `LKNPD_TIMEZONE_OFFSET` remain only in the vff-fiscal configuration.
+
+Do not commit real secrets, tokens, or credentials to Git.
 
 ### Payment timestamp
 
@@ -135,10 +146,11 @@ The authoritative fiscalization timestamp is `comment.object.captured_at` from t
 
 vff-fiscal converts the RFC3339 instant to `LKNPD_TIMEZONE_OFFSET` before sending it to FNS.
 
-Both files must be deployed together:
+Deploy the CGI and the full `lib/VFFFiscal/` helper directory together:
 
 - `srv_customlab_nalog.cgi`
 - `lib/VFFFiscal/PaymentTimestamp.pm`
+- `lib/VFFFiscal/AdapterConfig.pm`
 
 Do not replace the production adapter until staging checks pass. Validate a staged copy under `/tmp` inside the SHM container before installation:
 
@@ -148,8 +160,8 @@ docker exec shm-core-1 mkdir -p /tmp/vff-fiscal-adapter/lib/VFFFiscal
 docker cp adapters/shm/srv_customlab_nalog.cgi \
   shm-core-1:/tmp/vff-fiscal-adapter/srv_customlab_nalog.cgi
 
-docker cp adapters/shm/lib/VFFFiscal/PaymentTimestamp.pm \
-  shm-core-1:/tmp/vff-fiscal-adapter/lib/VFFFiscal/PaymentTimestamp.pm
+docker cp adapters/shm/lib/VFFFiscal \
+  shm-core-1:/tmp/vff-fiscal-adapter/lib/
 
 docker exec shm-core-1 \
   perl -c /tmp/vff-fiscal-adapter/srv_customlab_nalog.cgi
