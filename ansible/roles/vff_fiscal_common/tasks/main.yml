@@ -105,6 +105,7 @@
     - deploy_lock.py
     - compose_service_image.py
     - service_bootstrap_gate.py
+    - service_manifest_reconcile.py
   when: not ansible_check_mode | bool
 
 - name: Ensure application checkout directory exists

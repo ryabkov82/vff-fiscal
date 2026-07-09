@@ -294,27 +294,6 @@
     fail_msg: Built image revision label does not match requested commit.
   when: not ansible_check_mode | bool
 
-- name: Render candidate compose file
-  ansible.builtin.template:
-    src: docker-compose.yml.j2
-    dest: "{{ vff_fiscal_compose_path }}.new"
-    owner: root
-    group: root
-    mode: "0600"
-  when: not ansible_check_mode | bool
-
-- name: Validate candidate compose file
-  ansible.builtin.command: docker compose -f {{ vff_fiscal_compose_path }}.new config -q
-  changed_when: false
-  when: not ansible_check_mode | bool
-
-- name: Assert candidate compose file has no build section
-  ansible.builtin.command: grep -q '^[[:space:]]*build:' {{ vff_fiscal_compose_path }}.new
-  register: service_compose_build_probe
-  changed_when: false
-  failed_when: service_compose_build_probe.rc == 0
-  when: not ansible_check_mode | bool
-
 - name: Query health endpoint before cutover
   ansible.builtin.uri:
     url: http://127.0.0.1:{{ vff_fiscal_host_port }}/healthz
@@ -350,6 +329,33 @@
   when:
     - not ansible_check_mode | bool
     - not service_cutover_required | bool
+
+- name: Render candidate compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ vff_fiscal_compose_path }}.new"
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - not ansible_check_mode | bool
+    - service_cutover_required | bool
+
+- name: Validate candidate compose file
+  ansible.builtin.command: docker compose -f {{ vff_fiscal_compose_path }}.new config -q
+  changed_when: false
+  when:
+    - not ansible_check_mode | bool
+    - service_cutover_required | bool
+
+- name: Assert candidate compose file has no build section
+  ansible.builtin.command: grep -q '^[[:space:]]*build:' {{ vff_fiscal_compose_path }}.new
+  register: service_compose_build_probe
+  changed_when: false
+  failed_when: service_compose_build_probe.rc == 0
+  when:
+    - not ansible_check_mode | bool
+    - service_cutover_required | bool
 
 - name: Service cutover block
   when:
@@ -704,77 +710,70 @@
         name: vff_fiscal_common
         tasks_from: unpause_spool.yml
 
-- name: Remove stale candidate compose file when cutover skipped
+- name: Check for stale candidate compose file
+  ansible.builtin.stat:
+    path: "{{ vff_fiscal_compose_path }}.new"
+  register: service_stale_candidate_compose
+  when:
+    - not ansible_check_mode | bool
+    - not service_cutover_required | bool
+
+- name: Remove stale candidate compose file when present
   ansible.builtin.file:
     path: "{{ vff_fiscal_compose_path }}.new"
     state: absent
   when:
     - not ansible_check_mode | bool
     - not service_cutover_required | bool
+    - service_stale_candidate_compose.stat.exists | default(false)
 
-- name: Read SHM adapter safe status for manifest via stdin helper
+- name: Prepare idempotent service manifest reconciliation
   ansible.builtin.command:
     argv:
       - python3
-      - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
-      - status
+      - "{{ vff_fiscal_deploy_tools_dir }}/service_manifest_reconcile.py"
+      - prepare
   environment:
-    SHM_CONTAINER: "{{ shm_core_container }}"
-    DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
-    SHM_SCRIPT: shm-config.pl
-  register: service_adapter_status_raw
+    MANIFEST_PATH: "{{ vff_fiscal_deploy_state_path }}"
+    CANONICAL_MANIFEST_PATH: "{{ vff_fiscal_deploy_state_path }}.reconcile.payload"
+    BACKUP_ROOT: "{{ vff_fiscal_backup_root }}"
+    IMAGE_REPOSITORY: "{{ vff_fiscal_image_repository }}"
+    TARGET_COMMIT: "{{ vff_fiscal_version }}"
+    TARGET_IMAGE: "{{ service_target_image }}"
+    TARGET_IMAGE_ID: "{{ service_target_image_id.stdout }}"
+    RUNNING_IMAGE_TAG: "{{ service_current_image_tag.stdout }}"
+    RUNNING_IMAGE_ID: "{{ service_current_image_id.stdout }}"
+  register: service_manifest_reconcile
   changed_when: false
-  failed_when: false
-  when: not ansible_check_mode | bool
-
-- name: Parse SHM adapter safe status for manifest
-  ansible.builtin.set_fact:
-    service_adapter_status: "{{ service_adapter_status_raw.stdout | from_json }}"
+  failed_when: service_manifest_reconcile.rc != 0
   when:
     - not ansible_check_mode | bool
-    - service_adapter_status_raw.rc == 0
+    - not service_cutover_required | bool
 
-- name: Default SHM adapter safe status for manifest
+- name: Record service manifest reconciliation requirement
   ansible.builtin.set_fact:
-    service_adapter_status: {}
+    service_manifest_reconciliation_required: >-
+      {{ 'manifest_reconciliation_required=1' in service_manifest_reconcile.stdout_lines }}
   when:
     - not ansible_check_mode | bool
-    - service_adapter_status_raw.rc != 0
+    - not service_cutover_required | bool
 
-- name: Prepare service deploy manifest
-  ansible.builtin.set_fact:
-    vff_fiscal_common_manifest:
-      service_commit: "{{ vff_fiscal_version }}"
-      service_image: "{{ service_target_image }}"
-      service_image_id: "{{ service_target_image_id.stdout }}"
-      deployed_at: "{{ ansible_date_time.iso8601 }}"
-      backup_directory: >-
-        {{ service_backup_dir if service_cutover_required | bool
-        else vff_fiscal_existing_deploy_state.backup_directory | default('') }}
-      previous_service_image: >-
-        {{ service_previous_image if service_previous_image | length > 0
-        else vff_fiscal_existing_deploy_state.previous_service_image | default('') }}
-      previous_service_image_id: >-
-        {{ service_previous_image_id if service_previous_image_id | length > 0
-        else vff_fiscal_existing_deploy_state.previous_service_image_id | default('') }}
-      adapter_commit: "{{ vff_fiscal_existing_deploy_state.adapter_commit | default('') }}"
-      adapter_sha256: "{{ vff_fiscal_existing_deploy_state.adapter_sha256 | default('') }}"
-      adapter_enabled: >-
-        {{ service_adapter_status.enabled
-        | default(vff_fiscal_existing_deploy_state.adapter_enabled | default(false)) | bool }}
-      need_update_to_present: >-
-        {{ service_adapter_status.need_update_to_defined
-        | default(vff_fiscal_existing_deploy_state.need_update_to_present | default(false)) | bool }}
-      deployment_status: success
-  when: not ansible_check_mode | bool
+- name: Report idempotent service manifest already canonical
+  ansible.builtin.debug:
+    msg: Deploy manifest already matches trusted backup metadata; skipping manifest write.
+  when:
+    - not ansible_check_mode | bool
+    - not service_cutover_required | bool
+    - not service_manifest_reconciliation_required | default(false) | bool
 
-- name: Update deploy state after idempotent service verification
+- name: Write reconciled service deploy manifest
   ansible.builtin.include_role:
     name: vff_fiscal_common
-    tasks_from: write_deploy_state.yml
+    tasks_from: write_reconciled_deploy_state.yml
   when:
     - not ansible_check_mode | bool
-    - not service_cutover_required | default(true) | bool
+    - not service_cutover_required | bool
+    - service_manifest_reconciliation_required | default(false) | bool
 
 - name: Remove stale candidate compose file after check mode skip
   ansible.builtin.file:

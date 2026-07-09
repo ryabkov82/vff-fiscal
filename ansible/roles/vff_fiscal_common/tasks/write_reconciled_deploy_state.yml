@@ -1,0 +1,37 @@
+---
+- name: Write reconciled deploy manifest transaction
+  block:
+    - name: Stage reconciled deploy manifest payload
+      ansible.builtin.copy:
+        src: "{{ vff_fiscal_deploy_state_path }}.reconcile.payload"
+        dest: "{{ vff_fiscal_deploy_state_path }}.payload"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Atomically write reconciled deploy manifest
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 {{ vff_fiscal_deploy_tools_dir }}/write_manifest.py \
+          < {{ vff_fiscal_deploy_state_path }}.payload
+      args:
+        executable: /bin/bash
+      environment:
+        MANIFEST_PATH: "{{ vff_fiscal_deploy_state_path }}"
+      changed_when: true
+      no_log: true
+
+  always:
+    - name: Remove reconciled deploy manifest payload file
+      ansible.builtin.file:
+        path: "{{ vff_fiscal_deploy_state_path }}.payload"
+        state: absent
+      no_log: true
+
+    - name: Remove reconciled manifest staging file
+      ansible.builtin.file:
+        path: "{{ vff_fiscal_deploy_state_path }}.reconcile.payload"
+        state: absent
+      no_log: true

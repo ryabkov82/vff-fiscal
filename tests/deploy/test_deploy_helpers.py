@@ -50,6 +50,9 @@ shm_exec_preflight = load_module(
 service_bootstrap_gate = load_module(
     "service_bootstrap_gate", COMMON / "files/service_bootstrap_gate.py"
 )
+service_manifest_reconcile = load_module(
+    "service_manifest_reconcile", COMMON / "files/service_manifest_reconcile.py"
+)
 file_mode_gate = load_module(
     "file_mode_gate", COMMON / "files/file_mode_gate.py"
 )
@@ -812,6 +815,273 @@ class ComposeBackupProjectDirectoryTests(unittest.TestCase):
                 command = task["ansible.builtin.command"]
                 return command["argv"]
         raise AssertionError("rollback candidate validation task not found")
+
+
+PRODUCTION_TARGET_COMMIT = "204d0f4c9c4460fa4d6cbde59561ff25b1842345"
+PRODUCTION_TARGET_IMAGE = "vff-fiscal:204d0f4c9c44"
+PRODUCTION_TARGET_IMAGE_ID = (
+    "sha256:3f527a513aa1462ad2edc0348dc026e09fe43eb9f0395d658a00f71bdd2d512f"
+)
+PRODUCTION_PREVIOUS_IMAGE = "vff-fiscal:7a0fab5b546b"
+PRODUCTION_PREVIOUS_IMAGE_ID = (
+    "sha256:ff4745b9e41972a78cb0708ff9d36801fd4de8f7846ed68c255c6395a003d451"
+)
+PRODUCTION_DEPLOYED_AT = "2026-07-09T22:09:51Z"
+
+
+def write_service_manifest_fixture(
+    tmp_path: Path,
+    *,
+    manifest: dict[str, object],
+    backup_meta: dict[str, object],
+    backup_root: Path | None = None,
+) -> tuple[Path, Path, Path]:
+    root = backup_root or (tmp_path / "opt" / "vff-fiscal" / "backups" / "releases")
+    backup_dir = root / "20260710T000951-204d0f4c9c44" / "service"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = tmp_path / "deploy-state.json"
+    backup_meta = {
+        **backup_meta,
+        "backup_directory": str(backup_dir),
+    }
+    manifest = {
+        **manifest,
+        "backup_directory": str(backup_dir),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    (backup_dir / "backup-meta.json").write_text(
+        json.dumps(backup_meta, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return manifest_path, backup_dir, root
+
+
+class ServiceManifestReconcileTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.service = (SERVICE / "tasks/main.yml").read_text()
+
+    def reconcile(
+        self,
+        manifest_path: Path,
+        backup_root: Path,
+        *,
+        manifest: dict[str, object] | None = None,
+        backup_meta: dict[str, object] | None = None,
+        target_commit: str = PRODUCTION_TARGET_COMMIT,
+        target_image: str = PRODUCTION_TARGET_IMAGE,
+        target_image_id: str = PRODUCTION_TARGET_IMAGE_ID,
+        running_image_tag: str = PRODUCTION_TARGET_IMAGE,
+        running_image_id: str = PRODUCTION_TARGET_IMAGE_ID,
+        previous_image_id: str = PRODUCTION_PREVIOUS_IMAGE_ID,
+        payload_path: Path | None = None,
+    ) -> bool:
+        return service_manifest_reconcile.prepare_reconciliation(
+            manifest_path=manifest_path,
+            backup_root=str(backup_root),
+            image_repository="vff-fiscal",
+            target_commit=target_commit,
+            target_image=target_image,
+            target_image_id=target_image_id,
+            running_image_tag=running_image_tag,
+            running_image_id=running_image_id,
+            resolved_previous_image_id=previous_image_id,
+            image_id_resolver=lambda _image: previous_image_id,
+            canonical_manifest_path=payload_path,
+        )
+
+    def canonical_backup_meta(self) -> dict[str, object]:
+        return {
+            "component": "service",
+            "target_commit": PRODUCTION_TARGET_COMMIT,
+            "target_image": PRODUCTION_TARGET_IMAGE,
+            "previous_image": PRODUCTION_PREVIOUS_IMAGE,
+            "previous_image_id": PRODUCTION_PREVIOUS_IMAGE_ID,
+            "deployed_at": PRODUCTION_DEPLOYED_AT,
+        }
+
+    def canonical_manifest(self) -> dict[str, object]:
+        return {
+            "service_commit": PRODUCTION_TARGET_COMMIT,
+            "service_image": PRODUCTION_TARGET_IMAGE,
+            "service_image_id": PRODUCTION_TARGET_IMAGE_ID,
+            "deployed_at": PRODUCTION_DEPLOYED_AT,
+            "previous_service_image": PRODUCTION_PREVIOUS_IMAGE,
+            "previous_service_image_id": PRODUCTION_PREVIOUS_IMAGE_ID,
+            "adapter_commit": "abc123" * 6 + "abcd",
+            "adapter_sha256": "def456" * 10 + "abcd",
+            "adapter_enabled": True,
+            "need_update_to_present": False,
+            "deployment_status": "success",
+        }
+
+    def test_correct_manifest_is_not_rewritten(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest = self.canonical_manifest()
+            manifest_path, _, backup_root = write_service_manifest_fixture(
+                tmp_path,
+                manifest=manifest,
+                backup_meta=self.canonical_backup_meta(),
+            )
+            required = self.reconcile(manifest_path, backup_root)
+            self.assertFalse(required)
+
+    def test_production_corruption_is_repaired_from_backup_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            corrupted = self.canonical_manifest()
+            corrupted["previous_service_image"] = PRODUCTION_TARGET_IMAGE
+            corrupted["previous_service_image_id"] = PRODUCTION_TARGET_IMAGE_ID
+            corrupted["deployed_at"] = "2026-07-09T22:12:00Z"
+            manifest_path, _, backup_root = write_service_manifest_fixture(
+                tmp_path,
+                manifest=corrupted,
+                backup_meta=self.canonical_backup_meta(),
+            )
+            payload = tmp_path / "reconcile.payload"
+            required = self.reconcile(manifest_path, backup_root, payload_path=payload)
+            self.assertTrue(required)
+            repaired = json.loads(payload.read_text(encoding="utf-8"))
+            self.assertEqual(repaired["previous_service_image"], PRODUCTION_PREVIOUS_IMAGE)
+            self.assertEqual(repaired["previous_service_image_id"], PRODUCTION_PREVIOUS_IMAGE_ID)
+            self.assertEqual(repaired["deployed_at"], PRODUCTION_DEPLOYED_AT)
+            self.assertEqual(repaired["adapter_commit"], corrupted["adapter_commit"])
+
+    def test_second_run_after_repair_performs_no_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path, _, backup_root = write_service_manifest_fixture(
+                tmp_path,
+                manifest=self.canonical_manifest(),
+                backup_meta=self.canonical_backup_meta(),
+            )
+            payload = tmp_path / "reconcile.payload"
+            corrupted = json.loads(manifest_path.read_text(encoding="utf-8"))
+            corrupted["deployed_at"] = "2026-07-09T22:12:00Z"
+            manifest_path.write_text(json.dumps(corrupted, indent=2) + "\n", encoding="utf-8")
+            self.assertTrue(self.reconcile(manifest_path, backup_root, payload_path=payload))
+            manifest_path.write_text(payload.read_text(encoding="utf-8"), encoding="utf-8")
+            self.assertFalse(self.reconcile(manifest_path, backup_root, payload_path=payload))
+
+    def test_mismatched_target_commit_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path, _, backup_root = write_service_manifest_fixture(
+                tmp_path,
+                manifest=self.canonical_manifest(),
+                backup_meta=self.canonical_backup_meta(),
+            )
+            with self.assertRaises(ValueError):
+                self.reconcile(
+                    manifest_path,
+                    backup_root,
+                    target_commit="a" * 40,
+                )
+
+    def test_mismatched_target_image_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path, _, backup_root = write_service_manifest_fixture(
+                tmp_path,
+                manifest=self.canonical_manifest(),
+                backup_meta=self.canonical_backup_meta(),
+            )
+            with self.assertRaises(ValueError):
+                self.reconcile(
+                    manifest_path,
+                    backup_root,
+                    running_image_tag="vff-fiscal:deadbeef0000",
+                )
+
+    def test_mismatched_previous_image_id_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path, _, backup_root = write_service_manifest_fixture(
+                tmp_path,
+                manifest=self.canonical_manifest(),
+                backup_meta=self.canonical_backup_meta(),
+            )
+            with self.assertRaises(ValueError):
+                self.reconcile(
+                    manifest_path,
+                    backup_root,
+                    previous_image_id="sha256:" + "0" * 64,
+                )
+
+    def test_missing_backup_meta_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path, backup_dir, backup_root = write_service_manifest_fixture(
+                tmp_path,
+                manifest=self.canonical_manifest(),
+                backup_meta=self.canonical_backup_meta(),
+            )
+            (backup_dir / "backup-meta.json").unlink()
+            with self.assertRaises(ValueError):
+                self.reconcile(manifest_path, backup_root)
+
+    def test_backup_directory_outside_root_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            outside = tmp_path / "outside" / "service"
+            outside.mkdir(parents=True)
+            manifest_path = tmp_path / "deploy-state.json"
+            manifest = self.canonical_manifest()
+            manifest["backup_directory"] = str(outside)
+            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            (outside / "backup-meta.json").write_text(
+                json.dumps(self.canonical_backup_meta(), indent=2) + "\n",
+                encoding="utf-8",
+            )
+            backup_root = tmp_path / "opt" / "vff-fiscal" / "backups" / "releases"
+            backup_root.mkdir(parents=True)
+            with self.assertRaises(ValueError):
+                self.reconcile(manifest_path, backup_root)
+
+    def test_adapter_fields_are_preserved_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest = self.canonical_manifest()
+            manifest["deployed_at"] = "2026-07-09T22:12:00Z"
+            manifest_path, _, backup_root = write_service_manifest_fixture(
+                tmp_path,
+                manifest=manifest,
+                backup_meta=self.canonical_backup_meta(),
+            )
+            payload = tmp_path / "reconcile.payload"
+            self.reconcile(manifest_path, backup_root, payload_path=payload)
+            repaired = json.loads(payload.read_text(encoding="utf-8"))
+            self.assertEqual(repaired["adapter_commit"], manifest["adapter_commit"])
+            self.assertEqual(repaired["adapter_sha256"], manifest["adapter_sha256"])
+            self.assertEqual(repaired["adapter_enabled"], manifest["adapter_enabled"])
+            self.assertEqual(repaired["need_update_to_present"], manifest["need_update_to_present"])
+
+    def test_no_cutover_path_does_not_render_candidate_compose(self) -> None:
+        render = self.service.index("- name: Render candidate compose file")
+        render_section = self.service[render : render + 400]
+        self.assertIn("service_cutover_required | bool", render_section)
+        self.assertNotIn("not service_cutover_required", render_section)
+
+    def test_real_cutover_renders_candidate_before_spool_pause(self) -> None:
+        render_idx = self.service.index("Render candidate compose file")
+        validate_idx = self.service.index("Validate candidate compose file")
+        cutover_idx = self.service.index("- name: Service cutover block")
+        spool_idx = self.service.index("spool_cutover_gate.yml")
+        self.assertLess(render_idx, cutover_idx)
+        self.assertLess(validate_idx, cutover_idx)
+        self.assertLess(cutover_idx, spool_idx)
+
+    def test_idempotent_path_uses_conditional_manifest_reconciliation(self) -> None:
+        self.assertIn("service_manifest_reconcile.py", self.service)
+        self.assertIn("service_manifest_reconciliation_required", self.service)
+        self.assertIn("write_reconciled_deploy_state.yml", self.service)
+        self.assertNotIn("Update deploy state after idempotent service verification", self.service)
+        self.assertNotIn("- name: Prepare service deploy manifest", self.service)
+        reconcile_idx = self.service.index("Prepare idempotent service manifest reconciliation")
+        reconcile_section = self.service[reconcile_idx:]
+        self.assertNotIn("ansible_date_time.iso8601", reconcile_section)
+        self.assertNotIn("previous_service_image if service_previous_image", self.service)
 
 
 class DockerHealthReadinessTests(unittest.TestCase):
