@@ -13,6 +13,12 @@ use SHM qw(:all);
 use VFFFiscal::AdapterConfig qw(normalize_non_empty_scalar);
 
 my $MODULE = 'srv_customlab_nalog';
+my $shm;
+
+sub shm {
+    $shm //= SHM->new(skip_check_auth => 1);
+    return $shm;
+}
 
 sub fail {
     my ($message) = @_;
@@ -21,6 +27,7 @@ sub fail {
 }
 
 sub load_pay_systems_data {
+    shm();
     my $config_service = get_service('config', _id => 'pay_systems')
         or fail('pay_systems config service is missing');
     my $all_config = $config_service->get_data;
@@ -68,8 +75,7 @@ sub safe_status {
 sub write_pay_systems_data {
     my ($all_config) = @_;
     Core::Config::set_value('pay_systems', $all_config);
-    my $shm = SHM->new(skip_check_auth => 1);
-    $shm->commit;
+    shm()->commit;
 }
 
 sub cmd_status {
