@@ -143,10 +143,25 @@
     - not ansible_check_mode | bool
     - service_had_running_container | bool
 
-- name: Check existing deploy manifest before legacy bootstrap
-  ansible.builtin.stat:
-    path: "{{ vff_fiscal_deploy_state_path }}"
-  register: service_bootstrap_deploy_state_stat
+- name: Evaluate deploy manifest service identity for legacy bootstrap
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ vff_fiscal_deploy_tools_dir }}/service_bootstrap_gate.py"
+  environment:
+    MANIFEST_PATH: "{{ vff_fiscal_deploy_state_path }}"
+  register: service_bootstrap_gate
+  changed_when: false
+  failed_when: service_bootstrap_gate.rc != 0
+  when:
+    - not ansible_check_mode | bool
+    - service_had_running_container | bool
+    - not service_previous_image_is_commit_tag | bool
+
+- name: Record service bootstrap gate result
+  ansible.builtin.set_fact:
+    service_bootstrap_identity_registered: >-
+      {{ 'service_identity_registered=1' in service_bootstrap_gate.stdout_lines }}
   when:
     - not ansible_check_mode | bool
     - service_had_running_container | bool
@@ -157,13 +172,13 @@
     that:
       - vff_fiscal_allow_legacy_image_bootstrap | bool
       - vff_fiscal_legacy_image_commit is match('^[0-9a-f]{40}$')
-      - not (service_bootstrap_deploy_state_stat.stat.exists | default(false))
+      - not (service_bootstrap_identity_registered | default(false) | bool)
     fail_msg: >-
       Existing production service image {{ service_previous_image }} is mutable.
       Set vff_fiscal_allow_legacy_image_bootstrap=true and provide
       vff_fiscal_legacy_image_commit as the exact previous 40-character commit
-      for this one-time bootstrap. The bootstrap is refused once deploy-state
-      already exists.
+      for this one-time bootstrap. Bootstrap is refused once deploy-state already
+      records a service deployment identity.
   when:
     - not ansible_check_mode | bool
     - service_had_running_container | bool

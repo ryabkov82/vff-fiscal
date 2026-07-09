@@ -104,6 +104,7 @@
     - parse_lsattr.py
     - deploy_lock.py
     - compose_service_image.py
+    - service_bootstrap_gate.py
   when: not ansible_check_mode | bool
 
 - name: Ensure application checkout directory exists

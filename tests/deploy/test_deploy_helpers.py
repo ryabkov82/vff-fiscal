@@ -46,6 +46,9 @@ compose_service_image = load_module(
 shm_exec_preflight = load_module(
     "shm_exec_preflight", COMMON / "files/shm_exec_preflight.py"
 )
+service_bootstrap_gate = load_module(
+    "service_bootstrap_gate", COMMON / "files/service_bootstrap_gate.py"
+)
 
 
 def iter_ansible_task_dicts(node):
@@ -440,6 +443,86 @@ class DeployManifestTransactionTests(unittest.TestCase):
             self.assertIn("manifest write failed", result.stdout)
 
 
+class ServiceBootstrapGateTests(unittest.TestCase):
+    def test_no_manifest_allows_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "deploy-state.json"
+            present, registered = service_bootstrap_gate.evaluate_manifest(manifest)
+            self.assertFalse(present)
+            self.assertFalse(registered)
+
+    def test_adapter_only_manifest_allows_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "deploy-state.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "adapter_commit": "a" * 40,
+                        "adapter_sha256": "b" * 64,
+                        "adapter_enabled": True,
+                        "service_commit": "",
+                        "service_image": "",
+                        "service_image_id": "",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            present, registered = service_bootstrap_gate.evaluate_manifest(manifest)
+            self.assertTrue(present)
+            self.assertFalse(registered)
+
+    def test_service_commit_blocks_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "deploy-state.json"
+            manifest.write_text(
+                json.dumps({"service_commit": "c" * 40}) + "\n",
+                encoding="utf-8",
+            )
+            _, registered = service_bootstrap_gate.evaluate_manifest(manifest)
+            self.assertTrue(registered)
+
+    def test_service_image_blocks_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "deploy-state.json"
+            manifest.write_text(
+                json.dumps({"service_image": "vff-fiscal:prod"}) + "\n",
+                encoding="utf-8",
+            )
+            _, registered = service_bootstrap_gate.evaluate_manifest(manifest)
+            self.assertTrue(registered)
+
+    def test_service_image_id_blocks_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "deploy-state.json"
+            manifest.write_text(
+                json.dumps({"service_image_id": "sha256:deadbeef"}) + "\n",
+                encoding="utf-8",
+            )
+            _, registered = service_bootstrap_gate.evaluate_manifest(manifest)
+            self.assertTrue(registered)
+
+    def test_malformed_manifest_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "deploy-state.json"
+            manifest.write_text("{not-json", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                service_bootstrap_gate.evaluate_manifest(manifest)
+
+            with mock.patch.dict(os.environ, {"MANIFEST_PATH": str(manifest)}):
+                self.assertEqual(service_bootstrap_gate.main(), 1)
+
+    def test_main_reports_gate_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "deploy-state.json"
+            with mock.patch.dict(os.environ, {"MANIFEST_PATH": str(manifest)}):
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                    self.assertEqual(service_bootstrap_gate.main(), 0)
+                    output = stdout.getvalue()
+            self.assertIn("manifest_present=0", output)
+            self.assertIn("service_identity_registered=0", output)
+
+
 class HelperSafetyTests(unittest.TestCase):
     def test_lsattr_parser_reads_attribute_column_only(self) -> None:
         self.assertTrue(
@@ -620,15 +703,43 @@ class TransactionRoleTests(unittest.TestCase):
     def test_legacy_bootstrap_is_explicit_and_normalizes_compose(self) -> None:
         self.assertIn("vff_fiscal_allow_legacy_image_bootstrap", self.service)
         self.assertIn("vff_fiscal_legacy_image_commit is match('^[0-9a-f]{40}$')", self.service)
+        self.assertIn("service_bootstrap_gate.py", self.service)
+        self.assertIn("service_bootstrap_identity_registered", self.service)
+        self.assertNotIn("service_bootstrap_deploy_state_stat.stat.exists", self.service)
         self.assertIn("docker", self.service)
         self.assertIn("tag", self.service)
         self.assertIn("Normalize legacy rollback Compose", self.service)
         self.assertIn("Resolve normalized legacy rollback Compose image", self.service)
         self.assertIn("legacy_bootstrap", self.service)
 
+    def test_legacy_bootstrap_validation_precedes_mutating_steps(self) -> None:
+        gate_idx = self.service.index(
+            "Evaluate deploy manifest service identity for legacy bootstrap"
+        )
+        assert_idx = self.service.index("Validate explicit legacy image bootstrap request")
+        tag_idx = self.service.index("Create immutable local alias for legacy running image")
+        build_idx = self.service.index("Build target service image")
+        self.assertLess(gate_idx, assert_idx)
+        self.assertLess(assert_idx, tag_idx)
+        self.assertLess(tag_idx, build_idx)
+
+    def test_service_manifest_preserves_adapter_fields(self) -> None:
+        manifest_section = self.service[
+            self.service.index("Prepare successful service deploy manifest") :
+            self.service.index("Write successful service deploy manifest")
+        ]
+        for field in (
+            "adapter_commit",
+            "adapter_sha256",
+            "adapter_enabled",
+            "need_update_to_present",
+        ):
+            self.assertIn(f"vff_fiscal_existing_deploy_state.{field}", manifest_section)
+
     def test_fresh_checkout_skips_fetch_before_clone(self) -> None:
         common = (COMMON / "tasks/main.yml").read_text()
         self.assertIn("Check whether application checkout is already a Git repository", common)
+        self.assertIn("service_bootstrap_gate.py", common)
         fetch = common.index("Fetch remote main branch metadata")
         checkout = common.index("Checkout exact repository revision")
         self.assertLess(fetch, checkout)
