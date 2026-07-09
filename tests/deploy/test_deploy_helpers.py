@@ -49,6 +49,9 @@ shm_exec_preflight = load_module(
 service_bootstrap_gate = load_module(
     "service_bootstrap_gate", COMMON / "files/service_bootstrap_gate.py"
 )
+file_mode_gate = load_module(
+    "file_mode_gate", COMMON / "files/file_mode_gate.py"
+)
 
 
 def iter_ansible_task_dicts(node):
@@ -523,6 +526,60 @@ class ServiceBootstrapGateTests(unittest.TestCase):
             self.assertIn("service_identity_registered=0", output)
 
 
+class FileModeGateTests(unittest.TestCase):
+    def test_env_mode_0600_passes(self) -> None:
+        self.assertTrue(file_mode_gate.env_mode_allowed("0600"))
+
+    def test_env_mode_0400_passes(self) -> None:
+        self.assertTrue(file_mode_gate.env_mode_allowed("0400"))
+
+    def test_env_mode_0644_fails(self) -> None:
+        self.assertFalse(file_mode_gate.env_mode_allowed("0644"))
+
+    def test_env_mode_0660_fails(self) -> None:
+        self.assertFalse(file_mode_gate.env_mode_allowed("0660"))
+
+    def test_env_mode_0604_fails(self) -> None:
+        self.assertFalse(file_mode_gate.env_mode_allowed("0604"))
+
+    def test_env_mode_0700_fails(self) -> None:
+        self.assertFalse(file_mode_gate.env_mode_allowed("0700"))
+
+    def test_env_mode_missing_or_malformed_fails(self) -> None:
+        for mode in (None, "", "600", "00600", "06000", "abcd"):
+            self.assertFalse(file_mode_gate.env_mode_allowed(mode))
+
+    def test_state_mode_0600_passes(self) -> None:
+        self.assertTrue(file_mode_gate.state_mode_allowed("0600"))
+
+    def test_state_mode_0644_fails(self) -> None:
+        self.assertFalse(file_mode_gate.state_mode_allowed("0644"))
+
+    def test_state_mode_0400_fails(self) -> None:
+        self.assertFalse(file_mode_gate.state_mode_allowed("0400"))
+
+    def test_state_mode_0660_fails(self) -> None:
+        self.assertFalse(file_mode_gate.state_mode_allowed("0660"))
+
+    def test_decimal_int_filter_misinterprets_octal_mode(self) -> None:
+        self.assertEqual(int("0600"), 600)
+        self.assertNotEqual(int("0600"), 0o600)
+        self.assertTrue(file_mode_gate.env_mode_allowed("0600"))
+
+    def test_no_unsafe_stat_mode_int_checks_in_ansible(self) -> None:
+        violations: list[str] = []
+        decimal_mode_literals = ("384", "420", "448")
+        for path in sorted((ROOT / "ansible").rglob("*.yml")):
+            content = path.read_text()
+            relative = str(path.relative_to(ROOT))
+            if "stat.mode | int" in content:
+                violations.append(f"{relative}: stat.mode | int")
+            for literal in decimal_mode_literals:
+                if f"stat.mode" in content and literal in content:
+                    violations.append(f"{relative}: stat.mode decimal {literal}")
+        self.assertEqual(violations, [])
+
+
 class HelperSafetyTests(unittest.TestCase):
     def test_lsattr_parser_reads_attribute_column_only(self) -> None:
         self.assertTrue(
@@ -699,6 +756,47 @@ class TransactionRoleTests(unittest.TestCase):
             self.assertIn(fact, self.service)
         self.assertIn("not service_compose_replaced", self.service)
         self.assertIn("service_new_container_started", self.service)
+
+    def test_service_file_mode_validation_uses_octal_strings(self) -> None:
+        self.assertIn("service_env_stat.stat.mode in ['0600', '0400']", self.service)
+        self.assertIn("service_state_stat.stat.mode == '0600'", self.service)
+        self.assertIn("service_state_stat.stat.uid == vff_fiscal_runtime_uid", self.service)
+        self.assertIn("service_state_stat.stat.gid == vff_fiscal_runtime_gid", self.service)
+        self.assertNotIn("stat.mode | int", self.service)
+
+        group_vars = (ROOT / "ansible/group_vars/all.yml").read_text()
+        self.assertIn("vff_fiscal_runtime_uid: 65532", group_vars)
+        self.assertIn("vff_fiscal_runtime_gid: 65532", group_vars)
+
+    def test_service_permission_checks_precede_mutating_steps(self) -> None:
+        env_mode_idx = self.service.index("Assert service environment file permissions")
+        state_mode_idx = self.service.index("Require persistent state file")
+        bootstrap_idx = self.service.index(
+            "Evaluate deploy manifest service identity for legacy bootstrap"
+        )
+        tag_idx = self.service.index("Create immutable local alias for legacy running image")
+        build_idx = self.service.index("Build target service image")
+        candidate_idx = self.service.index("Render candidate compose file")
+        spool_idx = self.service.index("spool_cutover_gate.yml")
+        compose_idx = self.service.index("Atomically replace compose file")
+        restart_idx = self.service.index("up -d --no-deps --pull never {{ vff_fiscal_container_name }}")
+
+        for checkpoint in (
+            bootstrap_idx,
+            tag_idx,
+            build_idx,
+            candidate_idx,
+            spool_idx,
+            compose_idx,
+            restart_idx,
+        ):
+            self.assertLess(env_mode_idx, checkpoint)
+            self.assertLess(state_mode_idx, checkpoint)
+
+        self.assertLess(bootstrap_idx, tag_idx)
+        self.assertLess(tag_idx, build_idx)
+        self.assertLess(spool_idx, compose_idx)
+        self.assertLess(compose_idx, restart_idx)
 
     def test_legacy_bootstrap_is_explicit_and_normalizes_compose(self) -> None:
         self.assertIn("vff_fiscal_allow_legacy_image_bootstrap", self.service)

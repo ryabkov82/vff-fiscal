@@ -50,8 +50,8 @@
 - name: Assert service environment file permissions
   ansible.builtin.assert:
     that:
-      - service_env_stat.stat.mode | int <= 384
-    fail_msg: "{{ vff_fiscal_env_file }} must be mode 0600 or stricter."
+      - service_env_stat.stat.mode in ['0600', '0400']
+    fail_msg: "{{ vff_fiscal_env_file }} must be mode 0600 or 0400."
 
 - name: Assert state file exists
   ansible.builtin.stat:
@@ -65,7 +65,7 @@
       - service_state_stat.stat.isreg
       - service_state_stat.stat.uid == vff_fiscal_runtime_uid
       - service_state_stat.stat.gid == vff_fiscal_runtime_gid
-      - service_state_stat.stat.mode | int == 384
+      - service_state_stat.stat.mode == '0600'
     fail_msg: >-
       {{ vff_fiscal_state_path }} must exist, be owned by
       {{ vff_fiscal_runtime_uid }}:{{ vff_fiscal_runtime_gid }}, mode 0600.
