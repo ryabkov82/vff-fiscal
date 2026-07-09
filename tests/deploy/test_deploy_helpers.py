@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -52,6 +53,57 @@ service_bootstrap_gate = load_module(
 file_mode_gate = load_module(
     "file_mode_gate", COMMON / "files/file_mode_gate.py"
 )
+
+
+def docker_compose_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    probe = subprocess.run(
+        ["docker", "compose", "version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+def backup_compose_validation_violations() -> list[str]:
+    violations: list[str] = []
+    backup_markers = (
+        "service_backup_dir",
+        "service_rollback_backup_dir",
+        "/backups/releases/",
+    )
+    for path in sorted((ROOT / "ansible").rglob("*.yml")):
+        try:
+            parsed = yaml.safe_load(path.read_text())
+        except yaml.YAMLError:
+            continue
+        if parsed is None:
+            continue
+        for task in iter_ansible_task_dicts(parsed):
+            argv = None
+            shell = task.get("ansible.builtin.shell")
+            command = task.get("ansible.builtin.command")
+            if isinstance(command, dict) and "argv" in command:
+                argv = command["argv"]
+            elif isinstance(command, list):
+                argv = command
+            elif isinstance(shell, str):
+                argv = shell.split()
+            if not argv:
+                continue
+            argv_text = " ".join(str(part) for part in argv)
+            if "docker" not in argv_text or "compose" not in argv_text:
+                continue
+            if not any(marker in argv_text for marker in backup_markers):
+                continue
+            if "vff_fiscal_root" in argv_text and "project-directory" in argv_text:
+                continue
+            if "{{ vff_fiscal_compose_path }}" in argv_text and "service_backup_dir" not in argv_text:
+                continue
+            violations.append(f"{path.relative_to(ROOT)}:{task.get('name', '<unnamed>')}")
+    return violations
 
 
 def iter_ansible_task_dicts(node):
@@ -578,6 +630,141 @@ class FileModeGateTests(unittest.TestCase):
                 if f"stat.mode" in content and literal in content:
                     violations.append(f"{relative}: stat.mode decimal {literal}")
         self.assertEqual(violations, [])
+
+
+class ComposeBackupProjectDirectoryTests(unittest.TestCase):
+    LEGACY_COMPOSE_FIXTURE = textwrap.dedent(
+        """
+        services:
+          vff-fiscal:
+            image: vff-fiscal:test
+            env_file:
+              - .env
+            volumes:
+              - ./data:/var/lib/vff-fiscal
+        """
+    ).strip()
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.service = (SERVICE / "tasks/main.yml").read_text()
+        cls.service_rollback = (
+            ROOT / "ansible/roles/vff_fiscal_service_rollback/tasks/main.yml"
+        ).read_text()
+
+    def test_legacy_backup_compose_validation_uses_project_directory(self) -> None:
+        validation = self._legacy_validation_argv()
+        self.assertIn("--project-directory", validation)
+        self.assertIn("{{ vff_fiscal_root }}", validation)
+        project_dir_index = validation.index("--project-directory")
+        compose_file_index = validation.index("-f")
+        backup_file_index = validation.index("{{ service_backup_dir }}/docker-compose.yml")
+        self.assertLess(project_dir_index, compose_file_index)
+        self.assertEqual(validation[compose_file_index + 1], "{{ service_backup_dir }}/docker-compose.yml")
+        self.assertEqual(backup_file_index, compose_file_index + 1)
+
+    def test_legacy_backup_validation_precedes_compose_replacement(self) -> None:
+        validate_idx = self.service.index("Validate normalized legacy rollback Compose")
+        replace_idx = self.service.index("Atomically replace compose file")
+        self.assertLess(validate_idx, replace_idx)
+
+    def test_no_env_file_is_copied_into_service_backup(self) -> None:
+        parsed = yaml.safe_load(self.service)
+        for task in iter_ansible_task_dicts(parsed):
+            copy = task.get("ansible.builtin.copy")
+            if not copy:
+                continue
+            dest = str(copy.get("dest", ""))
+            src = str(copy.get("src", ""))
+            if "service_backup_dir" not in dest:
+                continue
+            self.assertNotIn(".env", dest, msg=task.get("name"))
+            self.assertNotIn("vff_fiscal_env_file", dest, msg=task.get("name"))
+            self.assertNotIn("vff_fiscal_env_file", src, msg=task.get("name"))
+
+    def test_deployment_rescue_restores_compose_before_execution(self) -> None:
+        rescue = self.service.split("  rescue:", 1)[1]
+        restore_idx = rescue.index("Restore previous compose file after failure")
+        start_idx = rescue.index("Start previous service image after failure")
+        self.assertLess(restore_idx, start_idx)
+        self.assertIn('dest: "{{ vff_fiscal_compose_path }}"', rescue)
+        self.assertIn("docker compose -f {{ vff_fiscal_compose_path }}", rescue)
+
+    def test_explicit_rollback_stages_candidate_under_project_root(self) -> None:
+        parsed = yaml.safe_load(self.service_rollback)
+        staged = False
+        for task in iter_ansible_task_dicts(parsed):
+            copy = task.get("ansible.builtin.copy")
+            if not copy:
+                continue
+            dest = str(copy.get("dest", ""))
+            if dest == '{{ vff_fiscal_compose_path }}.rollback-candidate':
+                staged = True
+        self.assertTrue(staged)
+        candidate_validation = self._rollback_candidate_validation_argv()
+        self.assertIn("{{ vff_fiscal_compose_path }}.rollback-candidate", candidate_validation)
+        self.assertNotIn("service_rollback_backup_dir", " ".join(candidate_validation))
+        replace_idx = self.service_rollback.index(
+            "Atomically replace production Compose with rollback candidate"
+        )
+        validate_idx = self.service_rollback.index("Validate rollback Compose candidate")
+        self.assertLess(validate_idx, replace_idx)
+
+    def test_no_backup_compose_validation_without_project_directory(self) -> None:
+        self.assertEqual(backup_compose_validation_violations(), [])
+
+    @unittest.skipUnless(docker_compose_available(), "docker compose is unavailable")
+    def test_backup_compose_validation_requires_original_project_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "opt" / "vff-fiscal"
+            backup_dir = project_root / "backups" / "releases" / "test" / "service"
+            backup_dir.mkdir(parents=True)
+            (project_root / ".env").write_text("VFF_FISCAL_API_KEY=secret\n", encoding="utf-8")
+            (project_root / "data").mkdir()
+            compose_path = backup_dir / "docker-compose.yml"
+            compose_path.write_text(self.LEGACY_COMPOSE_FIXTURE + "\n", encoding="utf-8")
+
+            without_project = subprocess.run(
+                ["docker", "compose", "-f", str(compose_path), "config", "-q"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            with_project = subprocess.run(
+                [
+                    "docker",
+                    "compose",
+                    "--project-directory",
+                    str(project_root),
+                    "-f",
+                    str(compose_path),
+                    "config",
+                    "-q",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(without_project.returncode, 0, without_project.stderr)
+            self.assertIn(".env", without_project.stderr)
+            self.assertEqual(with_project.returncode, 0, with_project.stderr)
+
+    def _legacy_validation_argv(self) -> list[str]:
+        parsed = yaml.safe_load(self.service)
+        for task in iter_ansible_task_dicts(parsed):
+            if task.get("name") == "Validate normalized legacy rollback Compose":
+                command = task["ansible.builtin.command"]
+                return command["argv"]
+        raise AssertionError("legacy validation task not found")
+
+    def _rollback_candidate_validation_argv(self) -> list[str]:
+        parsed = yaml.safe_load(self.service_rollback)
+        for task in iter_ansible_task_dicts(parsed):
+            if task.get("name") == "Validate rollback Compose candidate":
+                command = task["ansible.builtin.command"]
+                return command["argv"]
+        raise AssertionError("rollback candidate validation task not found")
 
 
 class HelperSafetyTests(unittest.TestCase):

@@ -429,6 +429,8 @@
         argv:
           - docker
           - compose
+          - --project-directory
+          - "{{ vff_fiscal_root }}"
           - -f
           - "{{ service_backup_dir }}/docker-compose.yml"
           - config
