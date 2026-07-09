@@ -102,6 +102,8 @@
     - immutable_recovery.py
     - host_preflight.py
     - parse_lsattr.py
+    - deploy_lock.py
+    - compose_service_image.py
   when: not ansible_check_mode | bool
 
 - name: Ensure application checkout directory exists
@@ -113,14 +115,22 @@
     mode: "0755"
   when: not ansible_check_mode | bool
 
+- name: Check whether application checkout is already a Git repository
+  ansible.builtin.stat:
+    path: "{{ vff_fiscal_app_dir }}/.git"
+  register: vff_fiscal_app_git_dir
+  when: not ansible_check_mode | bool
+
 - name: Fetch remote main branch metadata
   ansible.builtin.command: >-
     git fetch --prune origin {{ vff_fiscal_git_default_ref | regex_replace('^origin/', '') }}
   args:
     chdir: "{{ vff_fiscal_app_dir }}"
   changed_when: false
-  when: not ansible_check_mode | bool
-  # noqa: command-instead-of-module
+  when:
+    - not ansible_check_mode | bool
+    - vff_fiscal_app_git_dir.stat.exists | default(false)
+# noqa: command-instead-of-module
 
 - name: Checkout exact repository revision
   ansible.builtin.git:

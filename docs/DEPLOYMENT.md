@@ -87,6 +87,51 @@ make deploy ... EXTRA='-e vff_fiscal_allow_unreachable_commit=true'
 
 Branch names, tags, floating refs, and Make defaults from the local `HEAD` are rejected.
 
+### One-Time Legacy Image Bootstrap
+
+Older production hosts may still run `vff-fiscal:prod`, which is mutable and
+cannot be used as a safe rollback target. The service role rejects mutable
+previous images unless an explicit one-time bootstrap is requested.
+
+For the first automated service deployment only, provide the exact commit that
+produced the currently running legacy image:
+
+```bash
+make deploy-service HOST=vff-fiscal VERSION=<new-40-char-sha> \
+  EXTRA='-e vff_fiscal_allow_legacy_image_bootstrap=true -e vff_fiscal_legacy_image_commit=<legacy-40-char-sha>'
+```
+
+During this bootstrap Ansible does not pull or rebuild the legacy image. It
+reads the currently running container image ID, creates a local immutable alias
+`vff-fiscal:<first-12-chars-of-legacy-commit>` pointing to that exact image ID,
+verifies the alias, and writes the rollback Compose backup with the immutable
+alias instead of `:prod`. Backup metadata records `legacy_bootstrap=true`, the
+original mutable tag, the immutable alias, the explicit legacy commit, and the
+image ID.
+
+Never infer that `vff-fiscal:prod` matches the checkout on disk. If the legacy
+commit is wrong, rollback metadata will be wrong. Once `deploy-state.json`
+exists, the bootstrap path is refused; ordinary deployments again require the
+previous running service image to use a commit-derived immutable tag.
+
+## Deployment Lock
+
+Mutating playbooks (`deploy`, `deploy-service`, `deploy-adapter`,
+`rollback-service`, and `rollback-adapter`) acquire the same host-side atomic
+lock directory at `/opt/vff-fiscal/deploy.lock`. The read-only status playbook
+does not use the lock.
+
+The lock metadata contains only safe operational data: operation type, timestamp,
+controller hostname, process ID, and a random ownership token. A second mutating
+operation fails immediately with the existing lock metadata rather than waiting.
+The lock is released in an `always` path and only when the token matches, so one
+operation does not delete another active operation's lock.
+
+If an operator has verified that no deployment or rollback process is running
+and the lock is stale, inspect `/opt/vff-fiscal/deploy.lock/metadata.json`, then
+remove `/opt/vff-fiscal/deploy.lock` manually. Do not remove the lock while an
+Ansible process is active.
+
 ## Make targets
 
 | Target | Purpose |
@@ -164,16 +209,22 @@ Idempotent re-deploy of the same running image skips steps 5–10 (no spool paus
 5. Back up live CGI, helper modules, ownership/modes/immutable metadata
 6. Clear `need_update_to` via `Core::Config::set_value` (not SHM UI)
 7. Verify `need_update_to` is null/undef
-8. Remove `chattr +i`, atomically install helpers and CGI
-9. Compile installed files in both containers
-10. Restore previous `enabled` unless `vff_fiscal_adapter_enabled` is set
-11. Restore `chattr +i`, verify immutable flag and live SHA256
-12. Unpause only an operation-owned pause and verify it succeeded
-13. Compile in the running spool and run safe adapter smoke tests
-14. If post-unpause validation fails, reacquire the gate and transactionally
+8. Reject the operation if spool was already paused by an operator
+9. Remove `chattr +i`, verify `lsattr` reports `immutable=0`, then mark mutation started
+10. Clear `need_update_to` and atomically install helpers and CGI
+11. Compile installed files in `shm-core-1` while spool remains paused
+12. Restore previous `enabled` unless `vff_fiscal_adapter_enabled` is set
+13. Restore `chattr +i`, verify immutable flag and live SHA256
+14. Unpause only an operation-owned pause and verify it succeeded
+15. Compile in the running spool and run safe adapter smoke tests
+16. If post-unpause validation fails, reacquire the gate and transactionally
     restore the previous CGI and both helpers
 
 At no point may `shm-spool-1` run while the live CGI lacks `chattr +i`.
+Adapter deploy and rollback refuse live file mutation when the gate reports that
+spool was already paused by an operator; the operator's paused state is
+preserved and no SHM config, `chattr`, file replacement, or success manifest is
+written.
 
 ### Fail-closed immutable handling
 
@@ -204,6 +255,9 @@ Manual service rollback:
 - Requires `ROLLBACK_CONFIRM=1` and a service backup directory
 - Validates the rollback image exists locally (no rebuild, no pull)
 - Validates the backup Compose as a candidate before touching production
+- Resolves the `vff-fiscal` service image from the candidate Compose and
+  requires it to exactly match backup metadata; when metadata includes an image
+  ID, the local image ID must match too
 - Acquires the spool gate and blocks on `creating` receipts
 - Creates a new rollback-operation backup of current state, Compose, and manifest
 - Restores backed-up Compose and runs `docker compose up -d --no-deps --pull never`

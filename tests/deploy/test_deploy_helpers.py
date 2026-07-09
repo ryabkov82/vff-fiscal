@@ -36,6 +36,10 @@ immutable_recovery = load_module(
     "immutable_recovery", COMMON / "files/immutable_recovery.py"
 )
 run_shm_perl = load_module("run_shm_perl", COMMON / "files/run_shm_perl.py")
+deploy_lock = load_module("deploy_lock", COMMON / "files/deploy_lock.py")
+compose_service_image = load_module(
+    "compose_service_image", COMMON / "files/compose_service_image.py"
+)
 
 
 FAKE_DOCKER = r"""#!/usr/bin/env python3
@@ -240,6 +244,35 @@ class HelperSafetyTests(unittest.TestCase):
         self.assertIn("docker unpause shm-spool-1", message)
         self.assertNotIn("refresh_token", message)
 
+    def test_deploy_lock_contention_and_owned_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_dir = Path(tmp) / "deploy.lock"
+            self.assertEqual(deploy_lock.acquire(lock_dir, "deploy", "token-a"), 0)
+            self.assertEqual(deploy_lock.acquire(lock_dir, "deploy", "token-b"), 1)
+            self.assertEqual(deploy_lock.release(lock_dir, "token-b"), 1)
+            self.assertTrue(lock_dir.exists())
+            self.assertEqual(deploy_lock.release(lock_dir, "token-a"), 0)
+            self.assertFalse(lock_dir.exists())
+
+    def test_compose_service_image_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            compose = Path(tmp) / "docker-compose.yml"
+            compose.write_text(
+                textwrap.dedent(
+                    """
+                    services:
+                      vff-fiscal:
+                        image: vff-fiscal:abcdef123456
+                        pull_policy: never
+                    """
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                compose_service_image.service_image(compose, "vff-fiscal"),
+                "vff-fiscal:abcdef123456",
+            )
+
 
 class TransactionRoleTests(unittest.TestCase):
     @classmethod
@@ -264,6 +297,22 @@ class TransactionRoleTests(unittest.TestCase):
             self.assertIn(fact, self.service)
         self.assertIn("not service_compose_replaced", self.service)
         self.assertIn("service_new_container_started", self.service)
+
+    def test_legacy_bootstrap_is_explicit_and_normalizes_compose(self) -> None:
+        self.assertIn("vff_fiscal_allow_legacy_image_bootstrap", self.service)
+        self.assertIn("vff_fiscal_legacy_image_commit is match('^[0-9a-f]{40}$')", self.service)
+        self.assertIn("docker", self.service)
+        self.assertIn("tag", self.service)
+        self.assertIn("Normalize legacy rollback Compose", self.service)
+        self.assertIn("legacy_bootstrap", self.service)
+
+    def test_fresh_checkout_skips_fetch_before_clone(self) -> None:
+        common = (COMMON / "tasks/main.yml").read_text()
+        self.assertIn("Check whether application checkout is already a Git repository", common)
+        fetch = common.index("Fetch remote main branch metadata")
+        checkout = common.index("Checkout exact repository revision")
+        self.assertLess(fetch, checkout)
+        self.assertIn("vff_fiscal_app_git_dir.stat.exists", common)
 
     def test_service_state_gate_precedes_compose_replacement(self) -> None:
         self.assertLess(
@@ -290,6 +339,10 @@ class TransactionRoleTests(unittest.TestCase):
             self.adapter.index("adapter_files_modification_started: true"),
             self.adapter.index("Install helper modules atomically"),
         )
+        self.assertLess(
+            self.adapter.index("Assert adapter CGI is mutable before file replacement"),
+            self.adapter.index("Install helper modules atomically"),
+        )
         for fact in (
             "adapter_helpers_replaced",
             "adapter_cgi_replaced",
@@ -311,6 +364,16 @@ class TransactionRoleTests(unittest.TestCase):
         self.assertIn("restore_adapter.yml", self.adapter[post:])
         self.assertIn("spool_cutover_gate.yml", self.adapter_restore)
 
+    def test_cutover_failure_has_single_restore_cycle(self) -> None:
+        self.assertNotIn("Validate automatic rescue through reusable restoration transaction", self.adapter)
+        self.assertEqual(
+            self.adapter[
+                self.adapter.index("rescue:") :
+                self.adapter.index("Adapter post-unpause validation transaction")
+            ].count("Restore previous live adapter set while spool remains paused"),
+            1,
+        )
+
     def test_manual_rollback_has_safety_backup_and_safe_default(self) -> None:
         self.assertIn("pre-rollback adapter safety backup", self.adapter_rollback)
         self.assertIn("default(false)", self.adapter_rollback)
@@ -322,6 +385,28 @@ class TransactionRoleTests(unittest.TestCase):
             self.adapter.index("Adapter post-unpause validation transaction")
         ]
         self.assertNotIn("docker exec {{ shm_spool_container }}", cutover)
+
+    def test_adapter_rejects_operator_prepaused_before_mutation(self) -> None:
+        for content in (self.adapter, self.adapter_restore):
+            self.assertIn("vff_fiscal_spool_was_already_paused", content)
+            self.assertIn("paused by an operator", content)
+        cutover = self.adapter[
+            self.adapter.index("Adapter cutover block") :
+            self.adapter.index("Back up active adapter CGI")
+        ]
+        self.assertIn("Reject operator-prepaused spool", cutover)
+        self.assertNotIn("chattr", cutover)
+
+    def test_chattr_remove_is_verified_before_replacement(self) -> None:
+        for content in (self.adapter, self.adapter_restore):
+            self.assertIn("chattr", content)
+            self.assertIn("-i", content)
+            self.assertIn("parse_lsattr.py", content)
+            self.assertIn("immutable=0", content)
+        self.assertLess(
+            self.adapter_restore.index("Assert adapter CGI is mutable before restoration"),
+            self.adapter_restore.index("Restore adapter helper files atomically"),
+        )
 
     def test_metadata_distinguishes_previous_and_target(self) -> None:
         self.assertIn("target_commit", self.service)
@@ -350,6 +435,27 @@ class TransactionRoleTests(unittest.TestCase):
         self.assertIn("vff_fiscal_spool_leave_paused", finalizer)
         self.assertIn("Fail closed when immutable protection cannot be verified", finalizer)
         self.assertIn("parse_lsattr.py", finalizer)
+
+    def test_mutating_playbooks_use_deployment_lock(self) -> None:
+        playbooks = [
+            "deploy.yml",
+            "deploy-service.yml",
+            "deploy-adapter.yml",
+            "rollback-service.yml",
+            "rollback-adapter.yml",
+        ]
+        for name in playbooks:
+            content = (ROOT / "ansible/playbooks" / name).read_text()
+            self.assertIn("acquire_deploy_lock.yml", content)
+            self.assertIn("release_deploy_lock.yml", content)
+            self.assertIn("always:", content)
+        status = (ROOT / "ansible/playbooks/deploy-status.yml").read_text()
+        self.assertNotIn("deploy_lock", status)
+
+    def test_rollback_compose_image_is_verified_against_metadata(self) -> None:
+        self.assertIn("Resolve service image from rollback Compose candidate", self.service_rollback)
+        self.assertIn("service_rollback_candidate_image.stdout | trim == service_rollback_image", self.service_rollback)
+        self.assertIn("service_rollback_image_id.stdout == service_rollback_meta.previous_image_id", self.service_rollback)
 
 
 if __name__ == "__main__":

@@ -57,6 +57,13 @@
 
 - name: Validate rollback image exists locally
   ansible.builtin.command: docker image inspect {{ service_rollback_image }}
+  register: service_rollback_image_probe
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Read rollback image ID
+  ansible.builtin.command: docker image inspect -f '{{ "{{" }}.Id{{ "}}" }}' {{ service_rollback_image }}
+  register: service_rollback_image_id
   changed_when: false
   when: not ansible_check_mode | bool
 
@@ -80,6 +87,28 @@
       - config
       - -q
   changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Resolve service image from rollback Compose candidate
+  ansible.builtin.script:
+    cmd: >-
+      {{ playbook_dir }}/../roles/vff_fiscal_common/files/compose_service_image.py
+      --compose-file {{ vff_fiscal_compose_path }}.rollback-candidate
+      --service {{ vff_fiscal_container_name }}
+  register: service_rollback_candidate_image
+  changed_when: false
+  when: not ansible_check_mode | bool
+
+- name: Assert rollback Compose uses expected image
+  ansible.builtin.assert:
+    that:
+      - service_rollback_candidate_image.stdout | trim == service_rollback_image
+      - >-
+        service_rollback_meta.previous_image_id is not defined
+        or service_rollback_meta.previous_image_id | length == 0
+        or service_rollback_image_id.stdout == service_rollback_meta.previous_image_id
+    fail_msg: >-
+      Rollback Compose image or local image ID does not match backup metadata.
   when: not ansible_check_mode | bool
 
 - name: Inspect currently running service image tag
@@ -233,11 +262,6 @@
       ansible.builtin.include_role:
         name: vff_fiscal_common
         tasks_from: load_deploy_state.yml
-
-    - name: Read rollback image ID
-      ansible.builtin.command: docker image inspect -f '{{ "{{" }}.Id{{ "}}" }}' {{ service_rollback_image }}
-      register: service_rollback_image_id
-      changed_when: false
 
     - name: Prepare successful service rollback manifest
       ansible.builtin.set_fact:

@@ -270,6 +270,14 @@
         name: vff_fiscal_common
         tasks_from: spool_cutover_gate.yml
 
+    - name: Reject operator-prepaused spool for adapter cutover
+      ansible.builtin.assert:
+        that:
+          - not (vff_fiscal_spool_was_already_paused | default(false) | bool)
+        fail_msg: >-
+          Adapter cutover cannot modify live files while shm-spool-1 was already
+          paused by an operator. Unpause shm-spool-1 intentionally and retry.
+
     - name: Create adapter backup directory
       ansible.builtin.file:
         path: "{{ adapter_backup_dir }}"
@@ -353,6 +361,46 @@
       ansible.builtin.set_fact:
         adapter_backup_completed: true
 
+    - name: Remove immutable flag from active adapter CGI
+      ansible.builtin.command:
+        argv:
+          - chattr
+          - -i
+          - "{{ shm_adapter_path }}"
+      changed_when: true
+      when: adapter_active_file_stats.results[0].stat.exists | default(false)
+
+    - name: Verify immutable flag was removed from adapter CGI
+      ansible.builtin.command:
+        argv:
+          - lsattr
+          - "{{ shm_adapter_path }}"
+      register: adapter_mutation_lsattr
+      changed_when: false
+      when: adapter_active_file_stats.results[0].stat.exists | default(false)
+
+    - name: Parse adapter mutable attribute state
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/parse_lsattr.py"
+        stdin: "{{ adapter_mutation_lsattr.stdout | default('') }}"
+      register: adapter_mutation_immutable_parse
+      changed_when: false
+      when: adapter_active_file_stats.results[0].stat.exists | default(false)
+
+    - name: Assert adapter CGI is mutable before file replacement
+      ansible.builtin.assert:
+        that:
+          - "'immutable=0' in adapter_mutation_immutable_parse.stdout_lines"
+        fail_msg: Adapter CGI immutable flag could not be removed; live files were not changed.
+      when: adapter_active_file_stats.results[0].stat.exists | default(false)
+
+    - name: Mark adapter immutable removed and file modification started
+      ansible.builtin.set_fact:
+        adapter_immutable_removed: true
+        adapter_files_modification_started: true
+
     - name: Clear SHM need_update_to marker via stdin helper
       ansible.builtin.command:
         argv:
@@ -383,20 +431,6 @@
         that:
           - not (adapter_need_update_check.stdout | from_json | json_query('need_update_to_defined') | bool)
         fail_msg: need_update_to is still defined after clear-update-marker.
-
-    - name: Mark adapter file modification started
-      ansible.builtin.set_fact:
-        adapter_files_modification_started: true
-
-    - name: Remove immutable flag from active adapter CGI
-      ansible.builtin.command: chattr -i {{ shm_adapter_path }}
-      changed_when: true
-      failed_when: false
-      when: adapter_active_file_stats.results[0].stat.exists | default(false)
-
-    - name: Mark adapter immutable removed
-      ansible.builtin.set_fact:
-        adapter_immutable_removed: true
 
     - name: Ensure active adapter helper directory exists
       ansible.builtin.file:
@@ -559,10 +593,52 @@
         - adapter_backup_completed | default(false) | bool
         - adapter_files_modification_started | default(false) | bool
 
+    - name: Remove immutable flag before automatic adapter rescue
+      ansible.builtin.command:
+        argv:
+          - chattr
+          - -i
+          - "{{ shm_adapter_path }}"
+      changed_when: true
+      when:
+        - adapter_backup_completed | default(false) | bool
+        - adapter_files_modification_started | default(false) | bool
+
+    - name: Verify adapter CGI mutable before automatic rescue
+      ansible.builtin.command:
+        argv:
+          - lsattr
+          - "{{ shm_adapter_path }}"
+      register: adapter_rescue_lsattr
+      changed_when: false
+      when:
+        - adapter_backup_completed | default(false) | bool
+        - adapter_files_modification_started | default(false) | bool
+
+    - name: Parse adapter rescue mutable state
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/parse_lsattr.py"
+        stdin: "{{ adapter_rescue_lsattr.stdout | default('') }}"
+      register: adapter_rescue_immutable_parse
+      changed_when: false
+      when:
+        - adapter_backup_completed | default(false) | bool
+        - adapter_files_modification_started | default(false) | bool
+
+    - name: Assert adapter CGI mutable before automatic rescue
+      ansible.builtin.assert:
+        that:
+          - "'immutable=0' in adapter_rescue_immutable_parse.stdout_lines"
+        fail_msg: Adapter rescue cannot proceed because immutable protection could not be removed.
+      when:
+        - adapter_backup_completed | default(false) | bool
+        - adapter_files_modification_started | default(false) | bool
+
     - name: Restore previous live adapter set while spool remains paused
       ansible.builtin.shell: |
         set -euo pipefail
-        chattr -i {{ shm_adapter_path }}
         install -o {{ shm_adapter_owner }} -g {{ shm_adapter_group }} -m 0644 \
           {{ adapter_backup_dir }}/lib-VFFFiscal/AdapterConfig.pm \
           {{ shm_adapter_lib_dir }}/AdapterConfig.pm.rescue
@@ -655,23 +731,6 @@
       ansible.builtin.include_role:
         name: vff_fiscal_common
         tasks_from: finalize_adapter_immutable.yml
-
-- name: Validate automatic rescue through reusable restoration transaction
-  ansible.builtin.include_tasks: restore_adapter.yml
-  vars:
-    vff_fiscal_adapter_restore_host_dir: "{{ shm_adapter_stage_dir }}/restore-{{ deploy_timestamp }}"
-    vff_fiscal_adapter_restore_container_dir: >-
-      {{ shm_pay_systems_container_dir }}/.vff-fiscal-stage/restore-{{ deploy_timestamp }}
-    vff_fiscal_adapter_restore_enabled: "{{ adapter_pristine_enabled | bool }}"
-    vff_fiscal_adapter_restore_expected_checksums:
-      srv_customlab_nalog.cgi: "{{ adapter_backup_metadata.previous_cgi_sha256 }}"
-      lib/VFFFiscal/AdapterConfig.pm: "{{ adapter_backup_metadata.previous_adapter_config_sha256 }}"
-      lib/VFFFiscal/PaymentTimestamp.pm: "{{ adapter_backup_metadata.previous_payment_timestamp_sha256 }}"
-  when:
-    - not ansible_check_mode | bool
-    - adapter_cutover_failed | default(false) | bool
-    - adapter_backup_completed | default(false) | bool
-    - adapter_files_modification_started | default(false) | bool
 
 - name: Fail adapter deployment after automatic transactional restoration
   ansible.builtin.fail:

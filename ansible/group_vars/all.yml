@@ -9,6 +9,7 @@ vff_fiscal_compose_path: /opt/vff-fiscal/docker-compose.yml
 vff_fiscal_backup_root: /opt/vff-fiscal/backups/releases
 vff_fiscal_deploy_state_path: /opt/vff-fiscal/deploy-state.json
 vff_fiscal_deploy_tools_dir: /opt/vff-fiscal/deploy-tools
+vff_fiscal_deploy_lock_path: /opt/vff-fiscal/deploy.lock
 vff_fiscal_image_repository: vff-fiscal
 vff_fiscal_container_name: vff-fiscal
 vff_fiscal_host_port: 18080
@@ -19,6 +20,8 @@ vff_fiscal_runtime_gid: 65532
 vff_fiscal_docker_build_pull: true
 vff_fiscal_git_default_ref: origin/main
 vff_fiscal_allow_unreachable_commit: false
+vff_fiscal_allow_legacy_image_bootstrap: false
+vff_fiscal_legacy_image_commit: ""
 vff_fiscal_spool_quiet_retries: 60
 vff_fiscal_spool_quiet_delay: 5
 vff_fiscal_spool_gate_attempts: 5

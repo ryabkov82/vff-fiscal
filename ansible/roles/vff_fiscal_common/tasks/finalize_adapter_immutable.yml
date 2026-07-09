@@ -9,8 +9,7 @@
   failed_when: false
   when:
     - >-
-      vff_fiscal_spool_gate_passed | default(false) | bool
-      or adapter_files_modification_started | default(false) | bool
+      adapter_files_modification_started | default(false) | bool
       or vff_fiscal_spool_paused_by_operation | default(false) | bool
 
 - name: Verify adapter CGI immutable flag
@@ -23,8 +22,7 @@
   failed_when: false
   when:
     - >-
-      vff_fiscal_spool_gate_passed | default(false) | bool
-      or adapter_files_modification_started | default(false) | bool
+      adapter_files_modification_started | default(false) | bool
       or vff_fiscal_spool_paused_by_operation | default(false) | bool
 
 - name: Parse adapter CGI immutable attribute
@@ -38,8 +36,7 @@
   failed_when: false
   when:
     - >-
-      vff_fiscal_spool_gate_passed | default(false) | bool
-      or adapter_files_modification_started | default(false) | bool
+      adapter_files_modification_started | default(false) | bool
       or vff_fiscal_spool_paused_by_operation | default(false) | bool
 
 - name: Record immutable finalization state
@@ -58,8 +55,7 @@
       ) }}
   when:
     - >-
-      vff_fiscal_spool_gate_passed | default(false) | bool
-      or adapter_files_modification_started | default(false) | bool
+      adapter_files_modification_started | default(false) | bool
       or vff_fiscal_spool_paused_by_operation | default(false) | bool
 
 - name: Unpause operation-owned SHM spool after immutable protection confirmed
@@ -87,8 +83,7 @@
   failed_when: false
   when:
     - >-
-      vff_fiscal_spool_gate_passed | default(false) | bool
-      or adapter_files_modification_started | default(false) | bool
+      adapter_files_modification_started | default(false) | bool
       or vff_fiscal_spool_paused_by_operation | default(false) | bool
 
 - name: Fail closed when immutable protection cannot be verified
@@ -96,8 +91,7 @@
     msg: "{{ vff_fiscal_immutable_recovery_message.stdout }}"
   when:
     - >-
-      vff_fiscal_spool_gate_passed | default(false) | bool
-      or adapter_files_modification_started | default(false) | bool
+      adapter_files_modification_started | default(false) | bool
       or vff_fiscal_spool_paused_by_operation | default(false) | bool
     - not (adapter_immutable_restored | default(false) | bool)
 

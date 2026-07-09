@@ -1,0 +1,13 @@
+---
+- name: Release vff-fiscal deployment lock
+  ansible.builtin.script:
+    cmd: >-
+      deploy_lock.py release
+      --lock-dir {{ vff_fiscal_deploy_lock_path }}
+      --token {{ vff_fiscal_deploy_lock_token }}
+  register: vff_fiscal_deploy_lock_release
+  changed_when: "'deployment_lock_released=1' in vff_fiscal_deploy_lock_release.stdout"
+  failed_when: vff_fiscal_deploy_lock_release.rc != 0
+  when:
+    - not ansible_check_mode | bool
+    - vff_fiscal_deploy_lock_token is defined

@@ -9,6 +9,9 @@
     service_previous_image: ""
     service_previous_image_id: ""
     service_previous_compose_existed: false
+    service_previous_image_is_commit_tag: false
+    service_legacy_bootstrap: false
+    service_legacy_image_alias: ""
     service_cutover_started: false
     service_backup_completed: false
     service_compose_replaced: false
@@ -129,20 +132,82 @@
     - not ansible_check_mode | bool
     - service_had_running_container | bool
 
-- name: Require immutable previous service image tag
-  ansible.builtin.assert:
-    that:
-      - >-
-        service_previous_image is match(
-          '^' ~ (vff_fiscal_image_repository | regex_escape)
-          ~ ':(?:[0-9a-f]{12}|[0-9a-f]{40})$'
-        )
-    fail_msg: >-
-      Existing production service does not use a proven immutable commit tag;
-      refusing a cutover that could not be rolled back safely.
+- name: Determine whether previous service image is immutable
+  ansible.builtin.set_fact:
+    service_previous_image_is_commit_tag: >-
+      {{ service_previous_image is match(
+        '^' ~ (vff_fiscal_image_repository | regex_escape)
+        ~ ':(?:[0-9a-f]{12}|[0-9a-f]{40})$'
+      ) }}
   when:
     - not ansible_check_mode | bool
     - service_had_running_container | bool
+
+- name: Check existing deploy manifest before legacy bootstrap
+  ansible.builtin.stat:
+    path: "{{ vff_fiscal_deploy_state_path }}"
+  register: service_bootstrap_deploy_state_stat
+  when:
+    - not ansible_check_mode | bool
+    - service_had_running_container | bool
+    - not service_previous_image_is_commit_tag | bool
+
+- name: Validate explicit legacy image bootstrap request
+  ansible.builtin.assert:
+    that:
+      - vff_fiscal_allow_legacy_image_bootstrap | bool
+      - vff_fiscal_legacy_image_commit is match('^[0-9a-f]{40}$')
+      - not (service_bootstrap_deploy_state_stat.stat.exists | default(false))
+    fail_msg: >-
+      Existing production service image {{ service_previous_image }} is mutable.
+      Set vff_fiscal_allow_legacy_image_bootstrap=true and provide
+      vff_fiscal_legacy_image_commit as the exact previous 40-character commit
+      for this one-time bootstrap. The bootstrap is refused once deploy-state
+      already exists.
+  when:
+    - not ansible_check_mode | bool
+    - service_had_running_container | bool
+    - not service_previous_image_is_commit_tag | bool
+
+- name: Create immutable local alias for legacy running image
+  ansible.builtin.command:
+    argv:
+      - docker
+      - tag
+      - "{{ service_previous_image_id }}"
+      - "{{ vff_fiscal_image_repository }}:{{ vff_fiscal_legacy_image_commit[:12] }}"
+  changed_when: true
+  when:
+    - not ansible_check_mode | bool
+    - service_had_running_container | bool
+    - not service_previous_image_is_commit_tag | bool
+
+- name: Verify legacy immutable alias resolves to running image ID
+  ansible.builtin.command:
+    argv:
+      - docker
+      - image
+      - inspect
+      - -f
+      - "{{ '{{' }}.Id{{ '}}' }}"
+      - "{{ vff_fiscal_image_repository }}:{{ vff_fiscal_legacy_image_commit[:12] }}"
+  register: service_legacy_alias_id
+  changed_when: false
+  failed_when: service_legacy_alias_id.stdout != service_previous_image_id
+  when:
+    - not ansible_check_mode | bool
+    - service_had_running_container | bool
+    - not service_previous_image_is_commit_tag | bool
+
+- name: Record normalized previous service image alias
+  ansible.builtin.set_fact:
+    service_legacy_bootstrap: true
+    service_legacy_image_alias: "{{ vff_fiscal_image_repository }}:{{ vff_fiscal_legacy_image_commit[:12] }}"
+    service_previous_image: "{{ vff_fiscal_image_repository }}:{{ vff_fiscal_legacy_image_commit[:12] }}"
+  when:
+    - not ansible_check_mode | bool
+    - service_had_running_container | bool
+    - not service_previous_image_is_commit_tag | bool
 
 - name: Probe target service image
   ansible.builtin.command: docker image inspect {{ service_target_image }}
@@ -331,6 +396,15 @@
         mode: "0600"
       when: service_compose_stat.stat.exists | default(false)
 
+    - name: Normalize legacy rollback Compose to immutable local alias
+      ansible.builtin.replace:
+        path: "{{ service_backup_dir }}/docker-compose.yml"
+        regexp: ^(\s*image:\s*).*$
+        replace: \1{{ service_legacy_image_alias }}
+      when:
+        - service_compose_stat.stat.exists | default(false)
+        - service_legacy_bootstrap | bool
+
     - name: Record previous compose presence
       ansible.builtin.set_fact:
         service_previous_compose_existed: "{{ service_compose_stat.stat.exists | default(false) }}"
@@ -358,11 +432,18 @@
           target_commit: "{{ vff_fiscal_version }}"
           target_image: "{{ service_target_image }}"
           previous_commit: >-
-            {{ vff_fiscal_existing_deploy_state.service_commit
+            {{ vff_fiscal_legacy_image_commit
+            if service_legacy_bootstrap | bool
+            else vff_fiscal_existing_deploy_state.service_commit
             | default('unknown-pre-manifest', true) }}
           previous_image: "{{ service_previous_image }}"
           previous_image_id: "{{ service_previous_image_id }}"
           previous_compose_present: "{{ service_previous_compose_existed | bool }}"
+          legacy_bootstrap: "{{ service_legacy_bootstrap | bool }}"
+          legacy_original_image: >-
+            {{ service_current_image_tag.stdout | default('')
+            if service_legacy_bootstrap | bool else '' }}
+          legacy_immutable_alias: "{{ service_legacy_image_alias }}"
           backup_directory: "{{ service_backup_dir }}"
           deployed_at: "{{ ansible_date_time.iso8601 }}"
 

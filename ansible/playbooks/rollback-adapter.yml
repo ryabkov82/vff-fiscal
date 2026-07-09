@@ -3,5 +3,22 @@
   hosts: vff_fiscal
   serial: 1
   gather_facts: true
-  roles:
-    - role: vff_fiscal_adapter_rollback
+  tasks:
+    - name: Roll back adapter with deployment lock
+      block:
+        - name: Acquire deployment lock
+          ansible.builtin.include_role:
+            name: vff_fiscal_common
+            tasks_from: acquire_deploy_lock.yml
+          vars:
+            vff_fiscal_common_deploy_lock_operation: rollback-adapter
+
+        - name: Roll back adapter
+          ansible.builtin.include_role:
+            name: vff_fiscal_adapter_rollback
+
+      always:
+        - name: Release deployment lock
+          ansible.builtin.include_role:
+            name: vff_fiscal_common
+            tasks_from: release_deploy_lock.yml
