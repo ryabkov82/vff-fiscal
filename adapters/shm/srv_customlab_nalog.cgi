@@ -65,6 +65,15 @@ print_json({
 });
 exit;
 
+sub public_success_response {
+    my ($message) = @_;
+
+    return {
+        status => 200,
+        msg => $message,
+    };
+}
+
 sub send_receipt {
     my ($pay_id) = @_;
     my $pay = get_service('pay', _id => $pay_id);
@@ -74,12 +83,7 @@ sub send_receipt {
 
     my %payment = $pay->get;
     if (ref($payment{comment}) eq 'HASH' && $payment{comment}{income_send}) {
-        return {
-            status => 200,
-            msg => 'Receipt already sent',
-            receipt_uuid => $payment{comment}{receiptUuid},
-            receipt_link => $payment{comment}{receiptLink},
-        };
+        return public_success_response('Receipt already sent');
     }
 
     if (@allowed_pay_systems && !grep { $_ eq $payment{pay_system_id} } @allowed_pay_systems) {
@@ -148,10 +152,5 @@ sub send_receipt {
     });
     $shm->commit;
 
-    return {
-        status => 200,
-        msg => 'Receipt created',
-        receipt_uuid => $decoded->{receipt_uuid},
-        receipt_link => $decoded->{print_url},
-    };
+    return public_success_response('Receipt created');
 }

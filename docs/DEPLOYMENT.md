@@ -384,6 +384,13 @@ Precedence:
 
 The adapter sends `comment.object.captured_at` unchanged as `operation_time`.
 
+## SHM adapter privacy contract
+
+Successful CGI stdout for receipt creation contains only `status` and `msg`.
+Receipt UUIDs, print URLs, JSON URLs, and fiscal identifiers embedded in those
+URLs are stored in SHM payment metadata (`comment.receiptUuid`, `receiptLink`,
+`receiptJsonLink`) and must not appear in spool-persisted adapter output.
+
 ## Secrets
 
 Never commit `ansible/hosts.ini`, `.env`, `data/state.json`, backups, or tokens.
