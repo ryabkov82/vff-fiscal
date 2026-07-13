@@ -19,8 +19,15 @@ def validate_state(data: object) -> tuple[int, list[str]]:
         return 1, ["invalid_root"]
 
     version = data.get("version")
-    if version != 1:
+    if version not in (1, 2):
         errors.append("invalid_version")
+
+    if version == 2:
+        outbox = data.get("notification_outbox")
+        if outbox is None:
+            errors.append("missing_notification_outbox")
+        elif not isinstance(outbox, dict):
+            errors.append("invalid_notification_outbox")
 
     auth = data.get("auth")
     if not isinstance(auth, dict):

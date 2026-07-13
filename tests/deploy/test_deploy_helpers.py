@@ -56,6 +56,9 @@ service_manifest_reconcile = load_module(
 file_mode_gate = load_module(
     "file_mode_gate", COMMON / "files/file_mode_gate.py"
 )
+inspect_state = load_module(
+    "inspect_state", SERVICE / "files/inspect-state.py"
+)
 
 
 def docker_compose_available() -> bool:
@@ -1735,6 +1738,60 @@ class TransactionRoleTests(unittest.TestCase):
         self.assertIn("Resolve service image from rollback Compose candidate", self.service_rollback)
         self.assertIn("service_rollback_candidate_image.stdout | trim == service_rollback_image", self.service_rollback)
         self.assertIn("service_rollback_image_id.stdout == service_rollback_meta.previous_image_id", self.service_rollback)
+
+
+class InspectStateTests(unittest.TestCase):
+    def valid_auth(self) -> dict[str, str]:
+        return {
+            "refresh_token": "refresh-token",
+            "device_id": "device-id",
+            "inn": "7700000000",
+        }
+
+    def test_accepts_version_1_legacy_state(self) -> None:
+        rc, errors = inspect_state.validate_state(
+            {
+                "version": 1,
+                "auth": self.valid_auth(),
+                "receipts": {},
+            }
+        )
+        self.assertEqual(rc, 0, errors)
+        self.assertEqual(errors, [])
+
+    def test_accepts_version_2_with_empty_outbox(self) -> None:
+        rc, errors = inspect_state.validate_state(
+            {
+                "version": 2,
+                "auth": self.valid_auth(),
+                "receipts": {},
+                "notification_outbox": {},
+            }
+        )
+        self.assertEqual(rc, 0, errors)
+        self.assertEqual(errors, [])
+
+    def test_rejects_version_2_without_outbox(self) -> None:
+        rc, errors = inspect_state.validate_state(
+            {
+                "version": 2,
+                "auth": self.valid_auth(),
+                "receipts": {},
+            }
+        )
+        self.assertNotEqual(rc, 0)
+        self.assertIn("missing_notification_outbox", errors)
+
+    def test_rejects_unsupported_version(self) -> None:
+        rc, errors = inspect_state.validate_state(
+            {
+                "version": 3,
+                "auth": self.valid_auth(),
+                "receipts": {},
+            }
+        )
+        self.assertNotEqual(rc, 0)
+        self.assertIn("invalid_version", errors)
 
 
 if __name__ == "__main__":

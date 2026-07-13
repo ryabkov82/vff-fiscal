@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,8 +10,6 @@ import (
 	"sync"
 	"time"
 )
-
-const currentVersion = 1
 
 type AuthState struct {
 	RefreshToken string `json:"refresh_token"`
@@ -33,15 +32,17 @@ type ReceiptRecord struct {
 }
 
 type fileData struct {
-	Version  int                      `json:"version"`
-	Auth     AuthState                `json:"auth"`
-	Receipts map[string]ReceiptRecord `json:"receipts"`
+	Version            int                          `json:"version"`
+	Auth               AuthState                    `json:"auth"`
+	Receipts           map[string]ReceiptRecord     `json:"receipts"`
+	NotificationOutbox map[string]NotificationEvent `json:"notification_outbox"`
 }
 
 type Store struct {
-	mu   sync.Mutex
-	path string
-	data fileData
+	mu           sync.Mutex
+	path         string
+	data         fileData
+	syncStateDir func(string) error
 }
 
 func Open(path string, initial AuthState) (*Store, error) {
@@ -49,10 +50,7 @@ func Open(path string, initial AuthState) (*Store, error) {
 		return nil, errors.New("state path is empty")
 	}
 
-	s := &Store{
-		path: path,
-		data: fileData{Version: currentVersion, Receipts: make(map[string]ReceiptRecord)},
-	}
+	s := &Store{path: path, syncStateDir: syncParentDir}
 
 	content, err := os.ReadFile(path)
 	switch {
@@ -60,19 +58,34 @@ func Open(path string, initial AuthState) (*Store, error) {
 		if err := json.Unmarshal(content, &s.data); err != nil {
 			return nil, fmt.Errorf("decode state file: %w", err)
 		}
-		if s.data.Receipts == nil {
-			s.data.Receipts = make(map[string]ReceiptRecord)
+		if s.data.Version < 0 {
+			return nil, ErrInvalidStateVersion
+		}
+		if s.data.Version > currentVersion {
+			return nil, ErrUnsupportedStateVersion
+		}
+		if s.data.Version == currentVersion {
+			if err := validateOutboxPresence(content); err != nil {
+				return nil, err
+			}
 		}
 	case errors.Is(err, os.ErrNotExist):
-		s.data.Auth = initial
-		if err := s.saveLocked(); err != nil {
+		s.data = newFileData(initial)
+		if _, err := s.persistLocked(s.data); err != nil {
 			return nil, err
 		}
+		return s, nil
 	default:
 		return nil, fmt.Errorf("read state file: %w", err)
 	}
 
-	changed := false
+	changed := normalizeFileData(&s.data)
+
+	if s.data.Version < currentVersion {
+		s.data.Version = currentVersion
+		changed = true
+	}
+
 	if s.data.Auth.RefreshToken == "" && initial.RefreshToken != "" {
 		s.data.Auth.RefreshToken = initial.RefreshToken
 		changed = true
@@ -85,13 +98,41 @@ func Open(path string, initial AuthState) (*Store, error) {
 		s.data.Auth.INN = initial.INN
 		changed = true
 	}
+
 	if changed {
-		if err := s.saveLocked(); err != nil {
+		if _, err := s.persistLocked(s.data); err != nil {
 			return nil, err
 		}
 	}
 
 	return s, nil
+}
+
+func newFileData(initial AuthState) fileData {
+	return fileData{
+		Version:            currentVersion,
+		Auth:               initial,
+		Receipts:           make(map[string]ReceiptRecord),
+		NotificationOutbox: make(map[string]NotificationEvent),
+	}
+}
+
+// validateOutboxPresence enforces that a version 2 state carries an explicit
+// notification_outbox object. It must run before normalizeFileData so that a
+// corrupted v2 state cannot be silently repaired into an empty outbox.
+func validateOutboxPresence(content []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(content, &raw); err != nil {
+		return fmt.Errorf("decode state file: %w", err)
+	}
+	value, ok := raw["notification_outbox"]
+	if !ok {
+		return ErrInvalidNotificationOutbox
+	}
+	if string(bytes.TrimSpace(value)) == "null" {
+		return ErrInvalidNotificationOutbox
+	}
+	return nil
 }
 
 func (s *Store) Auth() AuthState {
@@ -103,8 +144,10 @@ func (s *Store) Auth() AuthState {
 func (s *Store) UpdateAuth(auth AuthState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data.Auth = auth
-	return s.saveLocked()
+	return s.mutateLocked(func(candidate *fileData) error {
+		candidate.Auth = auth
+		return nil
+	})
 }
 
 func (s *Store) GetReceipt(externalID string) (ReceiptRecord, bool) {
@@ -117,69 +160,144 @@ func (s *Store) GetReceipt(externalID string) (ReceiptRecord, bool) {
 func (s *Store) PutReceipt(record ReceiptRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.data.Receipts == nil {
-		s.data.Receipts = make(map[string]ReceiptRecord)
-	}
-	s.data.Receipts[record.ExternalID] = record
-	return s.saveLocked()
+	return s.mutateLocked(func(candidate *fileData) error {
+		candidate.Receipts[record.ExternalID] = record
+		return nil
+	})
 }
 
 func (s *Store) ReserveReceipt(record ReceiptRecord) (ReceiptRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.data.Receipts == nil {
-		s.data.Receipts = make(map[string]ReceiptRecord)
-	}
 	if existing, ok := s.data.Receipts[record.ExternalID]; ok {
 		return existing, false, nil
 	}
 
-	s.data.Receipts[record.ExternalID] = record
-	if err := s.saveLocked(); err != nil {
-		delete(s.data.Receipts, record.ExternalID)
+	if err := s.mutateLocked(func(candidate *fileData) error {
+		candidate.Receipts[record.ExternalID] = record
+		return nil
+	}); err != nil {
 		return ReceiptRecord{}, false, err
 	}
 	return record, true, nil
 }
 
-func (s *Store) saveLocked() error {
+func (s *Store) TransitionReceiptWithEvent(
+	externalID string,
+	expectedStatus string,
+	updated ReceiptRecord,
+	event NotificationEvent,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mutateLocked(func(candidate *fileData) error {
+		existing, ok := candidate.Receipts[externalID]
+		if !ok {
+			return ErrReceiptNotFound
+		}
+		if existing.Status != expectedStatus {
+			return ErrReceiptStatusMismatch
+		}
+		if updated.ExternalID != externalID {
+			return ErrInvalidTransitionInput
+		}
+		if event.EventID == "" {
+			return ErrInvalidTransitionInput
+		}
+		if event.ReceiptExternalID != externalID {
+			return ErrInvalidTransitionInput
+		}
+		if _, exists := candidate.NotificationOutbox[event.EventID]; exists {
+			return ErrDuplicateNotificationEvent
+		}
+
+		candidate.Receipts[externalID] = updated
+		candidate.NotificationOutbox[event.EventID] = cloneNotificationEvent(event)
+		return nil
+	})
+}
+
+func (s *Store) GetNotificationEvent(eventID string) (NotificationEvent, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	event, ok := s.data.NotificationOutbox[eventID]
+	if !ok {
+		return NotificationEvent{}, false
+	}
+	return cloneNotificationEvent(event), true
+}
+
+func (s *Store) mutateLocked(mutate func(*fileData) error) error {
+	candidate := cloneFileData(s.data)
+	normalizeFileData(&candidate)
+	if err := mutate(&candidate); err != nil {
+		return err
+	}
+	normalizeFileData(&candidate)
+
+	committed, err := s.persistLocked(candidate)
+	if committed {
+		s.data = candidate
+	}
+	return err
+}
+
+// persistLocked atomically writes data to disk. The returned committed flag is
+// true once the atomic rename has replaced the state file: rename is the
+// logical commit point. Any error before rename leaves both disk and the
+// committed flag untouched (committed=false). A failure to sync the parent
+// directory after rename returns ErrStateDurabilityUncertain with committed
+// still true, because the new state is already visible and callers must adopt
+// it in memory even though power-loss durability is not guaranteed.
+func (s *Store) persistLocked(data fileData) (bool, error) {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return fmt.Errorf("create state directory: %w", err)
+		return false, fmt.Errorf("create state directory: %w", err)
 	}
 
-	content, err := json.MarshalIndent(s.data, "", "  ")
+	content, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode state file: %w", err)
+		return false, fmt.Errorf("encode state file: %w", err)
 	}
 	content = append(content, '\n')
 
 	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".state-*.tmp")
 	if err != nil {
-		return fmt.Errorf("create temporary state file: %w", err)
+		return false, fmt.Errorf("create temporary state file: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	cleanup := true
+	defer func() {
+		if cleanup {
+			os.Remove(tmpName)
+		}
+	}()
 
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
-		return fmt.Errorf("chmod temporary state file: %w", err)
+		return false, fmt.Errorf("chmod temporary state file: %w", err)
 	}
 	if _, err := tmp.Write(content); err != nil {
 		tmp.Close()
-		return fmt.Errorf("write temporary state file: %w", err)
+		return false, fmt.Errorf("write temporary state file: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return fmt.Errorf("sync temporary state file: %w", err)
+		return false, fmt.Errorf("sync temporary state file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temporary state file: %w", err)
+		return false, fmt.Errorf("close temporary state file: %w", err)
 	}
 	if err := os.Rename(tmpName, s.path); err != nil {
-		return fmt.Errorf("replace state file: %w", err)
+		return false, fmt.Errorf("replace state file: %w", err)
 	}
-	if err := syncParentDir(s.path); err != nil {
-		return fmt.Errorf("sync state directory: %w", err)
+	cleanup = false
+
+	syncDir := s.syncStateDir
+	if syncDir == nil {
+		syncDir = syncParentDir
 	}
-	return os.Chmod(s.path, 0o600)
+	if err := syncDir(s.path); err != nil {
+		return true, fmt.Errorf("sync state directory: %w", errors.Join(ErrStateDurabilityUncertain, err))
+	}
+	return true, nil
 }
