@@ -1468,14 +1468,29 @@ class TransactionRoleTests(unittest.TestCase):
         self.assertNotIn("failed_when: false", auth_task.split("rescue:", 1)[0])
 
     def test_adapter_flags_cover_first_helper_failure(self) -> None:
-        self.assertLess(
-            self.adapter.index("adapter_files_modification_started: true"),
-            self.adapter.index("Install helper modules atomically"),
-        )
+        immutable_idx = self.adapter.index("Mark adapter immutable removed")
+        clear_marker_idx = self.adapter.index("Clear SHM need_update_to marker via stdin helper")
+        verify_marker_idx = self.adapter.index("Verify need_update_to remains cleared")
+        files_started_idx = self.adapter.index("Mark adapter file modification started")
+        install_helpers_idx = self.adapter.index("Install helper modules atomically")
+
+        self.assertLess(immutable_idx, clear_marker_idx)
+        self.assertLess(clear_marker_idx, verify_marker_idx)
+        self.assertLess(verify_marker_idx, files_started_idx)
+        self.assertLess(files_started_idx, install_helpers_idx)
         self.assertLess(
             self.adapter.index("Assert adapter CGI is mutable before file replacement"),
-            self.adapter.index("Install helper modules atomically"),
+            install_helpers_idx,
         )
+        pre_file_modification = self.adapter[immutable_idx:files_started_idx]
+        self.assertIn("adapter_immutable_removed: true", pre_file_modification)
+        self.assertNotIn("adapter_files_modification_started: true", pre_file_modification)
+        rescue = self.adapter[
+            self.adapter.index("rescue:") :
+            self.adapter.index("Adapter post-unpause validation transaction")
+        ]
+        self.assertIn("adapter_files_modification_started | default(false) | bool", rescue)
+        self.assertIn("finalize_adapter_immutable.yml", self.adapter)
         for fact in (
             "adapter_helpers_replaced",
             "adapter_cgi_replaced",

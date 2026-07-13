@@ -42,6 +42,9 @@ sub reset_state {
             pay_systems    => ['card'],
         },
     );
+    if ( $ENV{SHM_TEST_NO_UPDATE_MARKER} ) {
+        delete $PAY_SYSTEMS_DATA{srv_customlab_nalog}{need_update_to};
+    }
     $STATE_FILE = undef;
     @EVENT_LOG = ();
 }
@@ -113,9 +116,21 @@ sub get_service {
         }
         return \%copy;
     }
+
+    sub set_value {
+        my ( $self, $new_data ) = @_;
+        my $copy = _copy_pay_systems($new_data);
+        $Core::Config::STORE{pay_systems} = $copy;
+        SHM::_record_event('set_value');
+        return $self;
+    }
 }
 
 $STATE_FILE = $ENV{SHM_TEST_STATE_FILE}
     if defined $ENV{SHM_TEST_STATE_FILE} && length $ENV{SHM_TEST_STATE_FILE};
+
+if ( $ENV{SHM_TEST_NO_UPDATE_MARKER} ) {
+    delete $PAY_SYSTEMS_DATA{srv_customlab_nalog}{need_update_to};
+}
 
 1;

@@ -396,10 +396,9 @@
         fail_msg: Adapter CGI immutable flag could not be removed; live files were not changed.
       when: adapter_active_file_stats.results[0].stat.exists | default(false)
 
-    - name: Mark adapter immutable removed and file modification started
+    - name: Mark adapter immutable removed
       ansible.builtin.set_fact:
         adapter_immutable_removed: true
-        adapter_files_modification_started: true
 
     - name: Clear SHM need_update_to marker via stdin helper
       ansible.builtin.command:
@@ -431,6 +430,10 @@
         that:
           - not (adapter_need_update_check.stdout | from_json | json_query('need_update_to_defined') | bool)
         fail_msg: need_update_to is still defined after clear-update-marker.
+
+    - name: Mark adapter file modification started
+      ansible.builtin.set_fact:
+        adapter_files_modification_started: true
 
     - name: Ensure active adapter helper directory exists
       ansible.builtin.file:

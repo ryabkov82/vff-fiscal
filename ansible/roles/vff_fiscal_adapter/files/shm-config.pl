@@ -6,7 +6,6 @@ use warnings;
 use lib '/app/data/pay_systems/lib';
 
 use Core::Base;
-use Core::Config;
 use Core::Utils qw(encode_json);
 use JSON::PP ();
 use SHM qw(:all);
@@ -26,13 +25,18 @@ sub fail {
     die "$message\n";
 }
 
-sub load_pay_systems_data {
+sub pay_systems_config_service {
     shm();
     my $config_service = get_service('config', _id => 'pay_systems')
         or fail('pay_systems config service is missing');
+    return $config_service;
+}
+
+sub load_pay_systems_data {
+    my $config_service = pay_systems_config_service();
     my $all_config = $config_service->get_data;
     fail('pay_systems config data is missing') unless $all_config && ref $all_config eq 'HASH';
-    return $all_config;
+    return wantarray ? ($all_config, $config_service) : $all_config;
 }
 
 sub module_config {
@@ -73,8 +77,9 @@ sub safe_status {
 }
 
 sub write_pay_systems_data {
-    my ($all_config) = @_;
-    Core::Config::set_value('pay_systems', $all_config);
+    my ($all_config, $config_service) = @_;
+    $config_service //= pay_systems_config_service();
+    $config_service->set_value($all_config);
     shm()->commit;
 }
 
@@ -84,14 +89,19 @@ sub cmd_status {
 }
 
 sub cmd_clear_update_marker {
-    my $all_config = load_pay_systems_data();
+    my ($all_config, $config_service) = load_pay_systems_data();
     my %cfg = %{ module_config($all_config) };
     fail('module config is missing') unless %cfg || exists $all_config->{$MODULE};
+
+    unless (defined $cfg{need_update_to}) {
+        print encode_json({ status => 200, need_update_to_defined => JSON::PP::false });
+        return;
+    }
 
     $all_config->{$MODULE} = \%cfg unless ref $all_config->{$MODULE} eq 'HASH';
     delete $all_config->{$MODULE}{need_update_to};
 
-    write_pay_systems_data($all_config);
+    write_pay_systems_data($all_config, $config_service);
 
     my $after = load_pay_systems_data();
     my %after_cfg = %{ module_config($after) };
@@ -104,20 +114,32 @@ sub cmd_set_enabled {
     my ($value) = @_;
     fail('set-enabled requires 0 or 1') unless defined $value && $value =~ /\A[01]\z/;
 
-    my $all_config = load_pay_systems_data();
+    my ($all_config, $config_service) = load_pay_systems_data();
     my %cfg = %{ module_config($all_config) };
     fail('module config is missing') unless exists $all_config->{$MODULE};
 
-    $cfg{enabled} = $value ? 1 : 0;
+    my $requested_enabled = $value ? 1 : 0;
+    my $current_enabled = $cfg{enabled} ? 1 : 0;
+
+    if ($current_enabled == $requested_enabled && !defined $cfg{need_update_to}) {
+        print encode_json({
+            status   => 200,
+            enabled  => $current_enabled ? JSON::PP::true : JSON::PP::false,
+            need_update_to_defined => JSON::PP::false,
+        });
+        return;
+    }
+
+    $cfg{enabled} = $requested_enabled;
     delete $cfg{need_update_to};
     $all_config->{$MODULE} = \%cfg;
 
-    write_pay_systems_data($all_config);
+    write_pay_systems_data($all_config, $config_service);
 
     my $after = load_pay_systems_data();
     my %after_cfg = %{ module_config($after) };
     fail('need_update_to is still defined') if defined $after_cfg{need_update_to};
-    fail('enabled value mismatch') if ($after_cfg{enabled} ? 1 : 0) != ($value ? 1 : 0);
+    fail('enabled value mismatch') if ($after_cfg{enabled} ? 1 : 0) != $requested_enabled;
 
     print encode_json({
         status   => 200,
