@@ -1557,6 +1557,54 @@ class TransactionRoleTests(unittest.TestCase):
         ):
             self.assertIn(name, self.adapter_restore)
 
+    def test_post_unpause_validation_uses_stable_gate(self) -> None:
+        post_idx = self.adapter.index("Adapter post-unpause validation transaction")
+        require_idx = self.adapter.index("Require adapter post-unpause validation after successful cutover")
+        block_idx = self.adapter.index("  block:", post_idx)
+        when_section = self.adapter[post_idx:block_idx]
+
+        self.assertLess(require_idx, post_idx)
+        self.assertIn("adapter_post_unpause_validation_required", when_section)
+        self.assertNotIn("vff_fiscal_spool_paused_by_operation", when_section)
+
+    def test_post_unpause_rescue_records_failure_and_fails_closed(self) -> None:
+        post = self.adapter.index("Adapter post-unpause validation transaction")
+        rescue = self.adapter[post:].split("rescue:", 1)[1].split("Fail closed when adapter deployment was not accepted", 1)[0]
+
+        self.assertIn("adapter_post_unpause_validation_failed: true", rescue)
+        self.assertIn("when: adapter_post_unpause_validation_failed | default(false) | bool", rescue)
+        self.assertIn("Fail adapter deployment after restoring previous files", rescue)
+        self.assertNotIn("adapter_post_unpause_validation_required: false", self.adapter_restore)
+
+    def test_adapter_manifest_requires_explicit_acceptance(self) -> None:
+        prepare_idx = self.adapter.index("Prepare adapter deploy manifest")
+        write_idx = self.adapter.index("Update deploy state after successful adapter deployment")
+        fail_closed_idx = self.adapter.index("Fail closed when adapter deployment was not accepted")
+        manifest_section = self.adapter[prepare_idx:write_idx + len("Update deploy state after successful adapter deployment")]
+
+        self.assertLess(fail_closed_idx, prepare_idx)
+        self.assertIn("Accept idempotent adapter deployment", self.adapter)
+        self.assertIn("Accept adapter deployment after post-unpause validation", self.adapter)
+        self.assertIn("adapter_deployment_accepted | default(false) | bool", manifest_section)
+        self.assertIn("not adapter_post_unpause_validation_failed | default(false) | bool", manifest_section)
+        self.assertIn("not adapter_restoration_failed | default(false) | bool", manifest_section)
+        self.assertIn("adapter_deployment_accepted | default(false) | bool", self.adapter[write_idx:])
+
+    def test_restore_adapter_marker_ordering_matches_cutover(self) -> None:
+        immutable_idx = self.adapter_restore.index("Mark adapter immutable removed for restoration")
+        clear_idx = self.adapter_restore.index("Clear need_update_to before adapter restoration")
+        verify_idx = self.adapter_restore.index("Verify need_update_to remains cleared before adapter restoration")
+        files_started_idx = self.adapter_restore.index("Mark adapter restoration file modification started")
+        restore_helpers_idx = self.adapter_restore.index("Restore adapter helper files atomically")
+
+        self.assertLess(immutable_idx, clear_idx)
+        self.assertLess(clear_idx, verify_idx)
+        self.assertLess(verify_idx, files_started_idx)
+        self.assertLess(files_started_idx, restore_helpers_idx)
+        pre_file_modification = self.adapter_restore[immutable_idx:files_started_idx]
+        self.assertIn("adapter_immutable_removed: true", pre_file_modification)
+        self.assertNotIn("adapter_files_modification_started: true", pre_file_modification)
+
     def test_post_unpause_failure_restores_previous_files(self) -> None:
         post = self.adapter.index("Adapter post-unpause validation transaction")
         self.assertIn("restore_adapter.yml", self.adapter[post:])

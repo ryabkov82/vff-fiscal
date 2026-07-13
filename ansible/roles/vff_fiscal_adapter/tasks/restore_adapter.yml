@@ -104,9 +104,8 @@
           - "'immutable=0' in adapter_restore_immutable_parse.stdout_lines"
         fail_msg: Adapter restoration cannot proceed because immutable protection could not be removed.
 
-    - name: Mark adapter restoration modification started
+    - name: Mark adapter immutable removed for restoration
       ansible.builtin.set_fact:
-        adapter_files_modification_started: true
         adapter_immutable_removed: true
 
     - name: Clear need_update_to before adapter restoration
@@ -120,6 +119,29 @@
         DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
         SHM_SCRIPT: shm-config.pl
       changed_when: true
+
+    - name: Verify need_update_to remains cleared before adapter restoration
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ vff_fiscal_deploy_tools_dir }}/run_shm_perl.py"
+          - status
+      environment:
+        SHM_CONTAINER: "{{ shm_core_container }}"
+        DEPLOY_TOOLS_DIR: "{{ vff_fiscal_deploy_tools_dir }}"
+        SHM_SCRIPT: shm-config.pl
+      register: adapter_restore_need_update_check
+      changed_when: false
+
+    - name: Assert need_update_to remains cleared before adapter restoration
+      ansible.builtin.assert:
+        that:
+          - not (adapter_restore_need_update_check.stdout | from_json | json_query('need_update_to_defined') | bool)
+        fail_msg: need_update_to is still defined before adapter restoration.
+
+    - name: Mark adapter restoration file modification started
+      ansible.builtin.set_fact:
+        adapter_files_modification_started: true
 
     - name: Restore adapter helper files atomically
       ansible.builtin.shell: |

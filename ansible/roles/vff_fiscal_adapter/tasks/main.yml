@@ -12,6 +12,10 @@
     adapter_immutable_removed: false
     adapter_immutable_restored: false
     adapter_post_unpause_validation_started: false
+    adapter_post_unpause_validation_required: false
+    adapter_post_unpause_validation_failed: false
+    adapter_deployment_accepted: false
+    adapter_restoration_failed: false
     adapter_cutover_failed: false
     adapter_rescue_restored: false
     adapter_pristine_enabled: false
@@ -256,6 +260,13 @@
     msg: >-
       Active adapter files, immutable protection, need_update_to, and diagnostics
       already match staged repository content. Skipping cutover.
+  when:
+    - not ansible_check_mode | bool
+    - not adapter_cutover_required | bool
+
+- name: Accept idempotent adapter deployment
+  ansible.builtin.set_fact:
+    adapter_deployment_accepted: true
   when:
     - not ansible_check_mode | bool
     - not adapter_cutover_required | bool
@@ -744,14 +755,21 @@
     - not ansible_check_mode | bool
     - adapter_cutover_failed | default(false) | bool
 
-- name: Adapter post-unpause validation transaction
+- name: Require adapter post-unpause validation after successful cutover
+  ansible.builtin.set_fact:
+    adapter_post_unpause_validation_required: true
   when:
     - not ansible_check_mode | bool
     - adapter_cutover_required | bool
     - adapter_cgi_replaced | default(false) | bool
     - adapter_immutable_restored | default(false) | bool
     - not adapter_cutover_failed | default(false) | bool
-    - vff_fiscal_spool_paused_by_operation | default(false) | bool
+
+- name: Adapter post-unpause validation transaction
+  when:
+    - not ansible_check_mode | bool
+    - adapter_post_unpause_validation_required | default(false) | bool
+    - not adapter_post_unpause_validation_failed | default(false) | bool
   block:
     - name: Mark adapter post-unpause validation started
       ansible.builtin.set_fact:
@@ -797,7 +815,15 @@
         name: vff_fiscal_common
         tasks_from: run_shm_auth_smoke.yml
 
+    - name: Accept adapter deployment after post-unpause validation
+      ansible.builtin.set_fact:
+        adapter_deployment_accepted: true
+
   rescue:
+    - name: Mark adapter post-unpause validation failed
+      ansible.builtin.set_fact:
+        adapter_post_unpause_validation_failed: true
+
     - name: Stage previous adapter after post-unpause validation failure
       ansible.builtin.shell: |
         set -euo pipefail
@@ -816,6 +842,7 @@
 
     - name: Restore previous adapter after post-unpause validation failure
       ansible.builtin.include_tasks: restore_adapter.yml
+      when: adapter_post_unpause_validation_failed | default(false) | bool
       vars:
         vff_fiscal_adapter_restore_host_dir: "{{ shm_adapter_stage_dir }}/post-failure-{{ deploy_timestamp }}"
         vff_fiscal_adapter_restore_container_dir: >-
@@ -831,6 +858,19 @@
         msg: >-
           Adapter post-unpause validation failed. The previous CGI and helper
           files were restored transactionally and need_update_to remains cleared.
+      when: adapter_post_unpause_validation_failed | default(false) | bool
+
+- name: Fail closed when adapter deployment was not accepted
+  ansible.builtin.fail:
+    msg: >-
+      Adapter deployment did not reach an accepted state. Deploy manifest will
+      not be written.
+  when:
+    - not ansible_check_mode | bool
+    - not adapter_deployment_accepted | default(false) | bool
+    - not adapter_cutover_failed | default(false) | bool
+    - not adapter_post_unpause_validation_failed | default(false) | bool
+    - not adapter_restoration_failed | default(false) | bool
 
 - name: Read final SHM adapter status for manifest
   ansible.builtin.command:
@@ -889,10 +929,20 @@
         {{ adapter_manifest_status.need_update_to_defined
         | default(vff_fiscal_existing_deploy_state.need_update_to_present | default(false)) | bool }}
       deployment_status: success
-  when: not ansible_check_mode | bool
+  when:
+    - not ansible_check_mode | bool
+    - adapter_deployment_accepted | default(false) | bool
+    - not adapter_cutover_failed | default(false) | bool
+    - not adapter_post_unpause_validation_failed | default(false) | bool
+    - not adapter_restoration_failed | default(false) | bool
 
 - name: Update deploy state after successful adapter deployment
   ansible.builtin.include_role:
     name: vff_fiscal_common
     tasks_from: write_deploy_state.yml
-  when: not ansible_check_mode | bool
+  when:
+    - not ansible_check_mode | bool
+    - adapter_deployment_accepted | default(false) | bool
+    - not adapter_cutover_failed | default(false) | bool
+    - not adapter_post_unpause_validation_failed | default(false) | bool
+    - not adapter_restoration_failed | default(false) | bool

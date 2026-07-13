@@ -18,6 +18,8 @@ sub fail {
     die shift(@_) . "\n";
 }
 
+my $shm = SHM->new(skip_check_auth => 1);
+
 my $config_service = get_service('config', _id => 'pay_systems')
     or fail('pay_systems config service is missing');
 my $all_config = $config_service->get_data
