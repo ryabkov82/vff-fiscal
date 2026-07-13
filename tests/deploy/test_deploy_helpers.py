@@ -1499,6 +1499,56 @@ class TransactionRoleTests(unittest.TestCase):
         ):
             self.assertIn(fact, self.adapter)
 
+    def test_adapter_helper_checksum_assertion_uses_nested_loop_item(self) -> None:
+        verify_idx = self.adapter.index("Verify active helper module checksums")
+        assert_idx = self.adapter.index("Assert active helper module checksums match staged source")
+        diagnostic_idx = self.adapter.index("Run adapter diagnostic without action")
+        assertion = self.adapter[assert_idx : diagnostic_idx]
+
+        self.assertIn('loop: "{{ adapter_active_module_checksum.results }}"', assertion)
+        self.assertIn(
+            "adapter_stage_checksums.results[item.item.index].stat.checksum",
+            assertion,
+        )
+        self.assertNotIn("adapter_stage_checksums.results[item.index]", assertion)
+        self.assertIn(
+            "fail_msg: Active helper module checksum mismatch for {{ item.item.name }}.",
+            assertion,
+        )
+        self.assertLess(assert_idx, diagnostic_idx)
+        self.assertLess(verify_idx, assert_idx)
+
+    def test_adapter_helper_checksum_assertion_resolves_nested_index(self) -> None:
+        staged_results = [
+            {"stat": {"checksum": "cgi-sha"}},
+            {"stat": {"checksum": "config-sha"}},
+            {"stat": {"checksum": "timestamp-sha"}},
+        ]
+        loop_result = {
+            "stat": {"checksum": "config-sha"},
+            "item": {"name": "AdapterConfig.pm", "index": 1},
+        }
+
+        def matches_staged(result_item: dict) -> bool:
+            index = result_item["item"]["index"]
+            return (
+                result_item["stat"]["checksum"]
+                == staged_results[index]["stat"]["checksum"]
+            )
+
+        self.assertTrue(matches_staged(loop_result))
+        with self.assertRaises(KeyError):
+            _ = loop_result["index"]
+
+    def test_adapter_rescue_remains_gated_after_file_modification(self) -> None:
+        rescue = self.adapter[
+            self.adapter.index("rescue:") :
+            self.adapter.index("Adapter post-unpause validation transaction")
+        ]
+        self.assertIn("Restore previous live adapter set while spool remains paused", rescue)
+        self.assertIn("adapter_files_modification_started | default(false) | bool", rescue)
+        self.assertIn("Restore previous enabled state after cutover failure", rescue)
+
     def test_restoration_validates_all_three_checksums(self) -> None:
         for name in (
             "srv_customlab_nalog.cgi",

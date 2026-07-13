@@ -524,7 +524,7 @@
     - name: Assert active helper module checksums match staged source
       ansible.builtin.assert:
         that:
-          - item.stat.checksum == adapter_stage_checksums.results[item.index].stat.checksum
+          - item.stat.checksum == adapter_stage_checksums.results[item.item.index].stat.checksum
         fail_msg: Active helper module checksum mismatch for {{ item.item.name }}.
       loop: "{{ adapter_active_module_checksum.results }}"
       loop_control:
