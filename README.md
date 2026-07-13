@@ -1,5 +1,7 @@
 # vff-fiscal
 
+[Русская версия](README.ru.md)
+
 Self-hosted Go service for issuing receipts through the unofficial web API used by `lknpd.nalog.ru` ("Мой налог") and integrating it with SHM.
 
 > This is an unofficial integration. The internal FNS web API can change without notice. Test every update before production use.
@@ -14,7 +16,8 @@ SHM successful payment
   -> POST /api/v1/auth/token when access token refresh is required
   -> POST /api/v1/income
   -> approvedReceiptUuid + receipt URLs
-  -> adapter writes receiptUuid/receiptLink into SHM payment comment
+  -> adapter persists receiptUuid/receiptLink/receiptJsonLink in SHM payment comment
+  -> successful CGI stdout contains only status and msg (no receipt identifiers)
 ```
 
 The FNS refresh token, device ID and INN stay inside `vff-fiscal`; SHM never sends them to a third party.
@@ -152,7 +155,11 @@ Deploy the CGI and the full `lib/VFFFiscal/` helper directory together:
 - `lib/VFFFiscal/PaymentTimestamp.pm`
 - `lib/VFFFiscal/AdapterConfig.pm`
 
-Do not replace the production adapter until staging checks pass. Validate a staged copy under `/tmp` inside the SHM container before installation:
+Do not replace the production adapter until staging checks pass. Successful adapter
+responses must not expose receipt UUIDs, print URLs, or fiscal identifiers in
+spool-persisted stdout; those values belong in SHM payment metadata only.
+
+Validate a staged copy under `/tmp` inside the SHM container before installation:
 
 ```bash
 docker exec shm-core-1 mkdir -p /tmp/vff-fiscal-adapter/lib/VFFFiscal
@@ -198,7 +205,7 @@ make build
 
 ## Deployment
 
-Production deployment is manual and Ansible-driven. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+Production deployment is manual and Ansible-driven. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) ([Russian](docs/DEPLOYMENT.ru.md)).
 
 Quick examples:
 

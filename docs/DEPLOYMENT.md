@@ -1,5 +1,7 @@
 # Deployment
 
+[Русская версия](DEPLOYMENT.ru.md)
+
 Production deployments are driven by Ansible playbooks in `ansible/` and are
 invoked explicitly through Make targets. **Nothing deploys automatically from
 GitHub Actions or local `git push`.**
@@ -30,8 +32,13 @@ The service container reads `/opt/vff-fiscal/.env` and persists state under
 Saving pay-system settings through the UI calls `Core::Config::updated_pay_systems`,
 queues `Cloud::Jobs::job_download_paystem`, and may attempt to replace the custom
 CGI from the cloud downloader. Production protects the live CGI with `chattr +i`
-and keeps `need_update_to` null/undef. Ansible clears `need_update_to` directly
-through `Core::Config::set_value` and never triggers the UI save path.
+and keeps `need_update_to` null/undef. Ansible clears `need_update_to` through
+the host-side `shm-config.pl` helper, which loads the `pay_systems` config
+service with `get_service('config', _id => 'pay_systems')`, calls
+`$config_service->set_value(...)`, and commits through SHM. The helper never
+uses a static `Core::Config::set_value(...)` call and never triggers the UI save
+path. `clear-update-marker` and `set-enabled` are idempotent: they skip writes
+and commits when the requested state is already present.
 
 ## Prerequisites
 
@@ -205,26 +212,77 @@ Idempotent re-deploy of the same running image skips steps 5–10 (no spool paus
 
 1. Stage CGI and helper modules under `/opt/shm/pay_systems/.vff-fiscal-stage/<sha>/`
 2. Compile staged files in `shm-core-1` and `shm-spool-1`
-3. Acquire the bounded `docker top` quiet/pause/post-pause gate
-5. Back up live CGI, helper modules, ownership/modes/immutable metadata
-6. Clear `need_update_to` via `Core::Config::set_value` (not SHM UI)
-7. Verify `need_update_to` is null/undef
-8. Reject the operation if spool was already paused by an operator
-9. Remove `chattr +i`, verify `lsattr` reports `immutable=0`, then mark mutation started
-10. Clear `need_update_to` and atomically install helpers and CGI
-11. Compile installed files in `shm-core-1` while spool remains paused
-12. Restore previous `enabled` unless `vff_fiscal_adapter_enabled` is set
-13. Restore `chattr +i`, verify immutable flag and live SHA256
-14. Unpause only an operation-owned pause and verify it succeeded
-15. Compile in the running spool and run safe adapter smoke tests
-16. If post-unpause validation fails, reacquire the gate and transactionally
-    restore the previous CGI and both helpers
+3. Record staged and active checksums; verify immutable protection, SHM safe
+   status, and the no-action diagnostic response
+4. Decide `adapter_cutover_required`; skip the cutover block when everything
+   already matches
+5. **Idempotent path:** accept deployment explicitly, skip spool pause, backup,
+   `chattr` changes, and live file replacement; update the manifest to the
+   requested commit while preserving the existing `backup_directory` from the
+   last real cutover
+6. **Cutover path:**
+   1. Acquire the bounded `docker top` quiet/pause/post-pause gate
+   2. Reject the operation if spool was already paused by an operator
+   3. Back up live CGI, helper modules, ownership/modes/immutable metadata, and
+      safe SHM status
+   4. Remove `chattr +i`, verify `lsattr` reports `immutable=0`, and set only
+      `adapter_immutable_removed=true`
+   5. Clear `need_update_to` through `shm-config.pl`, verify it remains absent
+   6. Set `adapter_files_modification_started=true` immediately before the first
+      active file replacement
+   7. Atomically install helper modules and CGI
+   8. Compile installed files in `shm-core-1`, restore `enabled` unless
+      overridden, and verify active checksums against staged source
+   9. Run the core diagnostic smoke test while spool remains paused
+   10. In `always`: restore `chattr +i`, verify immutable protection, and unpause
+       only an operation-owned pause
+   11. Set `adapter_post_unpause_validation_required=true` after successful cutover
+   12. Post-unpause validation (stable gate, not tied to mutable spool ownership
+       facts): compile in the running spool, run missing-payment smoke, then run
+       authenticated `/v1/user` smoke through `shm-auth-smoke.pl` (which
+       initializes SHM before `get_service`)
+   13. Set `adapter_deployment_accepted=true` only after post-unpause validation
+       succeeds
 
 At no point may `shm-spool-1` run while the live CGI lacks `chattr +i`.
 Adapter deploy and rollback refuse live file mutation when the gate reports that
 spool was already paused by an operator; the operator's paused state is
 preserved and no SHM config, `chattr`, file replacement, or success manifest is
 written.
+
+Configuration failures before the first active file replacement do not trigger
+transactional file restoration; immutable protection is restored and the play
+fails clearly. Failures during or after file replacement use the full rescue
+path.
+
+If post-unpause validation fails, rescue sets
+`adapter_post_unpause_validation_failed=true`, restores the previous CGI and
+both helpers through `restore_adapter.yml`, and fails the play. Restoration
+cannot fall through to `deployment_status=success`.
+
+### Success manifest acceptance
+
+A success manifest is written only when `adapter_deployment_accepted=true`.
+
+Accepted paths:
+
+- **Idempotent adapter deploy:** active files, immutable protection,
+  `need_update_to`, and diagnostics already match staged content
+- **Successful cutover:** core validation, immutable restoration, spool unpause,
+  spool Perl checks, missing-payment smoke, and authenticated user smoke all pass
+
+The manifest is **not** prepared or written when any of these are true:
+
+- `adapter_cutover_failed`
+- `adapter_post_unpause_validation_failed`
+- `adapter_restoration_failed`
+
+A fail-closed guard also stops the play before manifest preparation when
+deployment was not explicitly accepted.
+
+Service idempotent redeploy preserves immutable deployment history in
+`deploy-state.json` and reconciles corrupted history from trusted backup metadata
+only when all trust checks pass.
 
 ### Fail-closed immutable handling
 
@@ -246,7 +304,8 @@ unpausing manually.
 
 SHM Perl helpers (`shm-config.pl`, `shm-auth-smoke.pl`) run from the host via
 `docker exec -i ... perl - < script` and do not require `/opt/vff-fiscal` to be
-mounted inside `shm-core-1`.
+mounted inside `shm-core-1`. Both helpers initialize an SHM context with
+`SHM->new(skip_check_auth => 1)` before calling `get_service`.
 
 ## Service rollback
 
@@ -368,7 +427,8 @@ as `unknown-pre-manifest` rather than being inferred from the new target.
 | `creating` receipt after pause | Play fails; spool unpaused in `always` |
 | state backup failure | Cutover aborted |
 | health / auth smoke failure | Service rescue restores previous Compose/image; state not restored |
-| adapter install/compile failure | Adapter rescue restores backed-up CGI + helpers; `need_update_to` cleared |
+| adapter install/compile failure | Adapter rescue restores backed-up CGI + helpers when file modification started; `need_update_to` cleared |
+| adapter post-unpause validation failure | Previous CGI and helpers restored; play fails; no success manifest |
 | `chattr +i` failure | Spool stays paused until `+i` verified or manual recovery |
 | manifest write failure | Deployment marked failed; prior manifest retained |
 
