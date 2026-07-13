@@ -18,6 +18,11 @@ import (
 
 const maxResponseBody = 1 << 20
 
+// ErrEmptyApprovedReceiptUUID marks a successful /income HTTP response that did
+// not carry an approvedReceiptUuid. The receipt may or may not have been
+// registered upstream, so callers must treat it as ambiguous.
+var ErrEmptyApprovedReceiptUUID = errors.New("lknpd returned an empty approvedReceiptUuid")
+
 type Config struct {
 	BaseURL        string
 	UserAgent      string
@@ -55,11 +60,18 @@ type APIError struct {
 	Err       error
 }
 
+// Error renders a safe, stable description of the failure. It deliberately never
+// includes the raw upstream Body nor the text of the wrapped e.Err, both of
+// which may carry sensitive data (INN, tokens, URLs, dialed hosts, upstream
+// response text). Only the operation and, when present, the HTTP status are
+// reported. The Body field and the wrapped error remain available for
+// in-process, programmatic use only (Unwrap, errors.Is/As) and must never be
+// logged or serialized.
 func (e *APIError) Error() string {
 	if e.Status != 0 {
-		return fmt.Sprintf("%s: HTTP %d: %s", e.Operation, e.Status, e.Body)
+		return fmt.Sprintf("%s: upstream responded with HTTP %d", e.Operation, e.Status)
 	}
-	return fmt.Sprintf("%s: %v", e.Operation, e.Err)
+	return fmt.Sprintf("%s: upstream request failed", e.Operation)
 }
 
 func (e *APIError) Unwrap() error { return e.Err }
@@ -143,7 +155,7 @@ func (c *Client) CreateIncome(ctx context.Context, params CreateIncomeParams) (R
 		return Receipt{}, err
 	}
 	if response.ApprovedReceiptUUID == "" {
-		return Receipt{}, errors.New("lknpd returned an empty approvedReceiptUuid")
+		return Receipt{}, &APIError{Operation: "POST /income", Ambiguous: true, Err: ErrEmptyApprovedReceiptUUID}
 	}
 
 	base := strings.TrimRight(c.cfg.BaseURL, "/")

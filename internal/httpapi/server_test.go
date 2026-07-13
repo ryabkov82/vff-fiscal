@@ -23,14 +23,23 @@ type fakeLKNPD struct {
 	createIncomeGate  chan struct{}
 	createIncomeErr   error
 	receipt           lknpd.Receipt
+	onCreateIncome    func()
+	getUserErr        error
+	cancelIncomeErr   error
 }
 
 func (f *fakeLKNPD) GetUser(context.Context) (lknpd.UserInfo, error) {
+	if f.getUserErr != nil {
+		return nil, f.getUserErr
+	}
 	return lknpd.UserInfo{"status": "ok"}, nil
 }
 
 func (f *fakeLKNPD) CreateIncome(_ context.Context, _ lknpd.CreateIncomeParams) (lknpd.Receipt, error) {
 	f.createIncomeCalls.Add(1)
+	if f.onCreateIncome != nil {
+		f.onCreateIncome()
+	}
 	if f.createIncomeGate != nil {
 		<-f.createIncomeGate
 	}
@@ -48,7 +57,7 @@ func (f *fakeLKNPD) CreateIncome(_ context.Context, _ lknpd.CreateIncomeParams) 
 }
 
 func (f *fakeLKNPD) CancelIncome(context.Context, string, string, time.Time) error {
-	return nil
+	return f.cancelIncomeErr
 }
 
 func newTestServer(t *testing.T, client lknpdClient) (*httptest.Server, *state.Store) {

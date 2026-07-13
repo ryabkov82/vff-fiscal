@@ -4,6 +4,13 @@ import "time"
 
 const NotificationDeliveryPending = "pending"
 
+// Semantic notification event types produced when a receipt creation attempt
+// leaves the receipt in a non-created terminal-for-notification state.
+const (
+	EventTypeReceiptFailed  = "receipt.failed"
+	EventTypeReceiptUnknown = "receipt.unknown"
+)
+
 type NotificationEvent struct {
 	SchemaVersion int       `json:"schema_version"`
 	EventID       string    `json:"event_id"`

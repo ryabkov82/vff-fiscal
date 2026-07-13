@@ -24,11 +24,20 @@ type lknpdClient interface {
 	CancelIncome(ctx context.Context, receiptUUID, comment string, operationTime time.Time) error
 }
 
+// receiptStore is the subset of *state.Store used by the HTTP layer. It is an
+// interface so failure and durability behavior can be exercised in tests.
+type receiptStore interface {
+	GetReceipt(externalID string) (state.ReceiptRecord, bool)
+	PutReceipt(record state.ReceiptRecord) error
+	ReserveReceipt(record state.ReceiptRecord) (state.ReceiptRecord, bool, error)
+	TransitionReceiptWithEvent(externalID, expectedStatus string, updated state.ReceiptRecord, event state.NotificationEvent) error
+}
+
 type Server struct {
 	apiKey             string
 	defaultServiceName string
 	client             lknpdClient
-	store              *state.Store
+	store              receiptStore
 	logger             *slog.Logger
 	mux                *http.ServeMux
 }
@@ -45,7 +54,7 @@ type cancelReceiptRequest struct {
 	OperationTime string `json:"operation_time,omitempty"`
 }
 
-func New(apiKey, defaultServiceName string, client lknpdClient, store *state.Store, logger *slog.Logger) *Server {
+func New(apiKey, defaultServiceName string, client lknpdClient, store receiptStore, logger *slog.Logger) *Server {
 	s := &Server{
 		apiKey:             apiKey,
 		defaultServiceName: defaultServiceName,
@@ -154,14 +163,37 @@ func (s *Server) createReceipt(w http.ResponseWriter, r *http.Request) {
 		OperationTime: operationTime,
 	})
 	if err != nil {
-		record.UpdatedAt = time.Now().UTC()
-		record.LastError = safeError(err)
-		record.Status = "failed"
-		var apiErr *lknpd.APIError
-		if errors.As(err, &apiErr) && apiErr.Ambiguous {
-			record.Status = "unknown"
+		outcome := classifyUpstream(err)
+
+		updated := record
+		updated.Status = outcome.ReceiptStatus
+		updated.LastError = outcome.Code
+		updated.UpdatedAt = time.Now().UTC()
+		event := buildFailureEvent(updated, outcome.EventType, outcome.Code, updated.UpdatedAt)
+
+		// Correlation uses only safe fields: the opaque event_id, the event
+		// type, the safe error code and the resulting receipt status. The
+		// plaintext external_id and the raw transition error are never logged.
+		txErr := s.store.TransitionReceiptWithEvent(record.ExternalID, "creating", updated, event)
+		switch {
+		case txErr == nil:
+		case errors.Is(txErr, state.ErrStateDurabilityUncertain):
+			s.logger.Warn("receipt failure transition committed but state directory sync is unconfirmed",
+				"event_id", event.EventID,
+				"event_type", outcome.EventType,
+				"error_code", outcome.Code,
+				"receipt_status", outcome.ReceiptStatus,
+			)
+		default:
+			s.logger.Error("failed to persist receipt failure transition",
+				"event_id", event.EventID,
+				"event_type", outcome.EventType,
+				"error_code", outcome.Code,
+				"receipt_status", outcome.ReceiptStatus,
+			)
+			writeError(w, http.StatusInternalServerError, "failed to persist receipt failure state")
+			return
 		}
-		_ = s.store.PutReceipt(record)
 		s.writeUpstreamError(w, err)
 		return
 	}
@@ -173,7 +205,10 @@ func (s *Server) createReceipt(w http.ResponseWriter, r *http.Request) {
 	record.LastError = ""
 	record.UpdatedAt = time.Now().UTC()
 	if err := s.store.PutReceipt(record); err != nil {
-		s.logger.Error("receipt created at FNS but local state update failed", "external_id", record.ExternalID, "receipt_uuid", record.ReceiptUUID, "error", err)
+		// Log only a safe static message. The receipt UUID, external ID, URLs,
+		// amount, service name and the raw state error (which may embed such
+		// values or the state path) are deliberately omitted.
+		s.logger.Error("receipt created at FNS but local state update failed; manual reconciliation is required")
 		writeError(w, http.StatusInternalServerError, "receipt was created but local state could not be updated; manual reconciliation is required")
 		return
 	}
@@ -245,18 +280,13 @@ func (s *Server) authorize(next http.Handler) http.Handler {
 	})
 }
 
+// writeUpstreamError renders an upstream failure using the shared classifier so
+// the HTTP status and the response message are always drawn from the same safe
+// outcome. The response body only ever contains a closed-set error code; the raw
+// upstream body is never written to any endpoint.
 func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
-	status := http.StatusBadGateway
-	var apiErr *lknpd.APIError
-	if errors.As(err, &apiErr) {
-		if apiErr.Status >= 400 && apiErr.Status < 500 {
-			status = http.StatusUnprocessableEntity
-		}
-		if apiErr.Ambiguous {
-			status = http.StatusServiceUnavailable
-		}
-	}
-	writeError(w, status, safeError(err))
+	outcome := classifyUpstream(err)
+	writeError(w, outcome.HTTPStatus, outcome.Code)
 }
 
 func (s *Server) logging(next http.Handler) http.Handler {
@@ -290,14 +320,6 @@ func parseOptionalTime(value string) (time.Time, error) {
 		return time.Time{}, nil
 	}
 	return time.Parse(time.RFC3339, value)
-}
-
-func safeError(err error) string {
-	message := err.Error()
-	if len(message) > 2048 {
-		return message[:2048]
-	}
-	return message
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
