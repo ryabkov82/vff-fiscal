@@ -1623,9 +1623,68 @@ class TransactionRoleTests(unittest.TestCase):
             self.adapter_restore.index("Finalize immutable protection for adapter restoration"),
         )
         post_transaction = self.adapter_restore[
-            self.adapter_restore.index("Compile restored files in SHM spool after unpause") :
+            self.adapter_restore.index("Compile restored helper modules in SHM spool after unpause") :
         ]
         self.assertIn("not (adapter_restoration_failed | default(false) | bool)", post_transaction)
+
+    def test_helper_perl_compile_uses_parent_lib_include(self) -> None:
+        """PaymentData imports sibling modules; perl -c needs parent lib on @INC."""
+        stage_include = "{{ adapter_stage_container_dir }}/lib"
+        active_include = "{{ shm_pay_systems_container_dir }}/lib"
+        restore_include = "{{ vff_fiscal_adapter_restore_container_dir }}/lib"
+        wrong_include = "{{ shm_adapter_lib_container_dir }}"
+
+        staged = self.adapter[
+            self.adapter.index("Compile staged helper modules in SHM core container") :
+            self.adapter.index("Record staged adapter checksums")
+        ]
+        self.assertIn(f"-I {stage_include}", staged)
+        self.assertIn("PaymentData.pm", staged)
+        self.assertNotIn(f"-I {wrong_include}", staged)
+
+        installed = self.adapter[
+            self.adapter.index("Compile installed helper modules in SHM core container") :
+            self.adapter.index("Restore adapter enabled setting unless explicitly overridden")
+        ]
+        self.assertIn(f"-I {active_include}", installed)
+        self.assertNotIn(f"-I {wrong_include}", installed)
+
+        rescued = self.adapter[
+            self.adapter.index("Compile rescued helper modules in SHM core") :
+            self.adapter.index("Restore previous enabled state after cutover failure")
+        ]
+        self.assertIn(f'"{active_include}"', rescued)
+        self.assertNotIn(f'"{wrong_include}"', rescued)
+
+        post = self.adapter[
+            self.adapter.index("Compile installed helper modules in SHM spool after unpause") :
+            self.adapter.index("Run adapter missing-payment smoke test from running spool")
+        ]
+        self.assertIn(f'"{active_include}"', post)
+        self.assertNotIn(f'"{wrong_include}"', post)
+
+        restore_candidates = self.adapter_restore[
+            self.adapter_restore.index("Compile restore helper candidates in SHM core before pausing") :
+            self.adapter_restore.index("Reset spool ownership before adapter restoration")
+        ]
+        self.assertIn(f'"{restore_include}"', restore_candidates)
+        self.assertIn("PaymentData.pm", restore_candidates)
+
+        restore_active = self.adapter_restore[
+            self.adapter_restore.index(
+                "Compile restored helper modules in SHM core while spool remains paused"
+            ) :
+            self.adapter_restore.index("Restore safe adapter enabled state")
+        ]
+        self.assertIn(f'"{active_include}"', restore_active)
+        self.assertNotIn(f'"{wrong_include}"', restore_active)
+
+        restore_spool = self.adapter_restore[
+            self.adapter_restore.index("Compile restored helper modules in SHM spool after unpause") :
+            self.adapter_restore.index("Diagnose restored adapter in SHM spool")
+        ]
+        self.assertIn(f'"{active_include}"', restore_spool)
+        self.assertNotIn(f'"{wrong_include}"', restore_spool)
 
     def test_cutover_failure_has_single_restore_cycle(self) -> None:
         self.assertNotIn("Validate automatic rescue through reusable restoration transaction", self.adapter)

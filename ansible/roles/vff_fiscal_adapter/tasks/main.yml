@@ -153,7 +153,10 @@
   when: not ansible_check_mode | bool
 
 - name: Compile staged helper modules in SHM core container
-  ansible.builtin.command: docker exec {{ shm_core_container }} perl -c {{ adapter_stage_container_dir }}/lib/VFFFiscal/{{ item }}
+  ansible.builtin.command: >-
+    docker exec {{ shm_core_container }}
+    perl -I {{ adapter_stage_container_dir }}/lib
+    -c {{ adapter_stage_container_dir }}/lib/VFFFiscal/{{ item }}
   loop:
     - AdapterConfig.pm
     - PaymentTimestamp.pm
@@ -162,7 +165,10 @@
   when: not ansible_check_mode | bool
 
 - name: Compile staged helper modules in SHM spool container
-  ansible.builtin.command: docker exec {{ shm_spool_container }} perl -c {{ adapter_stage_container_dir }}/lib/VFFFiscal/{{ item }}
+  ansible.builtin.command: >-
+    docker exec {{ shm_spool_container }}
+    perl -I {{ adapter_stage_container_dir }}/lib
+    -c {{ adapter_stage_container_dir }}/lib/VFFFiscal/{{ item }}
   loop:
     - AdapterConfig.pm
     - PaymentTimestamp.pm
@@ -506,7 +512,10 @@
       changed_when: false
 
     - name: Compile installed helper modules in SHM core container
-      ansible.builtin.command: docker exec {{ shm_core_container }} perl -c {{ shm_adapter_lib_container_dir }}/{{ item }}
+      ansible.builtin.command: >-
+        docker exec {{ shm_core_container }}
+        perl -I {{ shm_pay_systems_container_dir }}/lib
+        -c {{ shm_adapter_lib_container_dir }}/{{ item }}
       loop:
         - AdapterConfig.pm
         - PaymentTimestamp.pm
@@ -723,7 +732,7 @@
         - adapter_backup_completed | default(false) | bool
         - adapter_files_modification_started | default(false) | bool
 
-    - name: Compile rescued adapter files in SHM core
+    - name: Compile rescued adapter CGI in SHM core
       ansible.builtin.command:
         argv:
           - docker
@@ -731,13 +740,28 @@
           - "{{ shm_core_container }}"
           - perl
           - -c
-          - "{{ item }}"
+          - "{{ shm_adapter_container_path }}"
+      changed_when: false
+      when:
+        - adapter_backup_completed | default(false) | bool
+        - adapter_files_modification_started | default(false) | bool
+
+    - name: Compile rescued helper modules in SHM core
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ shm_core_container }}"
+          - perl
+          - -I
+          - "{{ shm_pay_systems_container_dir }}/lib"
+          - -c
+          - "{{ shm_adapter_lib_container_dir }}/{{ item }}"
       changed_when: false
       loop:
-        - "{{ shm_adapter_container_path }}"
-        - "{{ shm_adapter_lib_container_dir }}/AdapterConfig.pm"
-        - "{{ shm_adapter_lib_container_dir }}/PaymentTimestamp.pm"
-        - "{{ shm_adapter_lib_container_dir }}/PaymentData.pm"
+        - AdapterConfig.pm
+        - PaymentTimestamp.pm
+        - PaymentData.pm
       when:
         - adapter_backup_completed | default(false) | bool
         - adapter_files_modification_started | default(false) | bool
@@ -801,7 +825,7 @@
       ansible.builtin.set_fact:
         adapter_post_unpause_validation_started: true
 
-    - name: Compile installed files in SHM spool after unpause
+    - name: Compile installed adapter CGI in SHM spool after unpause
       ansible.builtin.command:
         argv:
           - docker
@@ -809,13 +833,25 @@
           - "{{ shm_spool_container }}"
           - perl
           - -c
-          - "{{ item }}"
+          - "{{ shm_adapter_container_path }}"
+      changed_when: false
+
+    - name: Compile installed helper modules in SHM spool after unpause
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ shm_spool_container }}"
+          - perl
+          - -I
+          - "{{ shm_pay_systems_container_dir }}/lib"
+          - -c
+          - "{{ shm_adapter_lib_container_dir }}/{{ item }}"
       changed_when: false
       loop:
-        - "{{ shm_adapter_container_path }}"
-        - "{{ shm_adapter_lib_container_dir }}/AdapterConfig.pm"
-        - "{{ shm_adapter_lib_container_dir }}/PaymentTimestamp.pm"
-        - "{{ shm_adapter_lib_container_dir }}/PaymentData.pm"
+        - AdapterConfig.pm
+        - PaymentTimestamp.pm
+        - PaymentData.pm
 
     - name: Run adapter missing-payment smoke test from running spool
       ansible.builtin.command:

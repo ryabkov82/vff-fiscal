@@ -21,7 +21,7 @@
   loop_control:
     label: "{{ item.item }}"
 
-- name: Compile restore candidates in SHM core before pausing
+- name: Compile restore CGI candidates in SHM core before pausing
   ansible.builtin.command:
     argv:
       - docker
@@ -29,15 +29,27 @@
       - "{{ shm_core_container }}"
       - perl
       - -c
-      - "{{ vff_fiscal_adapter_restore_container_dir }}/{{ item }}"
+      - "{{ vff_fiscal_adapter_restore_container_dir }}/srv_customlab_nalog.cgi"
+  changed_when: false
+
+- name: Compile restore helper candidates in SHM core before pausing
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ shm_core_container }}"
+      - perl
+      - -I
+      - "{{ vff_fiscal_adapter_restore_container_dir }}/lib"
+      - -c
+      - "{{ vff_fiscal_adapter_restore_container_dir }}/lib/VFFFiscal/{{ item }}"
   changed_when: false
   loop:
-    - srv_customlab_nalog.cgi
-    - lib/VFFFiscal/AdapterConfig.pm
-    - lib/VFFFiscal/PaymentTimestamp.pm
-    - lib/VFFFiscal/PaymentData.pm
+    - AdapterConfig.pm
+    - PaymentTimestamp.pm
+    - PaymentData.pm
 
-- name: Compile restore candidates in SHM spool before pausing
+- name: Compile restore CGI candidates in SHM spool before pausing
   ansible.builtin.command:
     argv:
       - docker
@@ -45,13 +57,25 @@
       - "{{ shm_spool_container }}"
       - perl
       - -c
-      - "{{ vff_fiscal_adapter_restore_container_dir }}/{{ item }}"
+      - "{{ vff_fiscal_adapter_restore_container_dir }}/srv_customlab_nalog.cgi"
+  changed_when: false
+
+- name: Compile restore helper candidates in SHM spool before pausing
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ shm_spool_container }}"
+      - perl
+      - -I
+      - "{{ vff_fiscal_adapter_restore_container_dir }}/lib"
+      - -c
+      - "{{ vff_fiscal_adapter_restore_container_dir }}/lib/VFFFiscal/{{ item }}"
   changed_when: false
   loop:
-    - srv_customlab_nalog.cgi
-    - lib/VFFFiscal/AdapterConfig.pm
-    - lib/VFFFiscal/PaymentTimestamp.pm
-    - lib/VFFFiscal/PaymentData.pm
+    - AdapterConfig.pm
+    - PaymentTimestamp.pm
+    - PaymentData.pm
 
 - name: Reset spool ownership before adapter restoration
   ansible.builtin.set_fact:
@@ -192,7 +216,7 @@
       loop_control:
         label: "{{ item.item.key }}"
 
-    - name: Compile restored files in SHM core while spool remains paused
+    - name: Compile restored CGI in SHM core while spool remains paused
       ansible.builtin.command:
         argv:
           - docker
@@ -200,13 +224,25 @@
           - "{{ shm_core_container }}"
           - perl
           - -c
-          - "{{ item }}"
+          - "{{ shm_adapter_container_path }}"
+      changed_when: false
+
+    - name: Compile restored helper modules in SHM core while spool remains paused
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ shm_core_container }}"
+          - perl
+          - -I
+          - "{{ shm_pay_systems_container_dir }}/lib"
+          - -c
+          - "{{ shm_adapter_lib_container_dir }}/{{ item }}"
       changed_when: false
       loop:
-        - "{{ shm_adapter_container_path }}"
-        - "{{ shm_adapter_lib_container_dir }}/AdapterConfig.pm"
-        - "{{ shm_adapter_lib_container_dir }}/PaymentTimestamp.pm"
-        - "{{ shm_adapter_lib_container_dir }}/PaymentData.pm"
+        - AdapterConfig.pm
+        - PaymentTimestamp.pm
+        - PaymentData.pm
 
     - name: Restore safe adapter enabled state
       ansible.builtin.command:
@@ -241,7 +277,7 @@
         name: vff_fiscal_common
         tasks_from: finalize_adapter_immutable.yml
 
-- name: Compile restored files in SHM spool after unpause
+- name: Compile restored CGI in SHM spool after unpause
   ansible.builtin.command:
     argv:
       - docker
@@ -249,13 +285,28 @@
       - "{{ shm_spool_container }}"
       - perl
       - -c
-      - "{{ item }}"
+      - "{{ shm_adapter_container_path }}"
+  changed_when: false
+  when:
+    - vff_fiscal_spool_paused_by_operation | default(false) | bool
+    - not (adapter_restoration_failed | default(false) | bool)
+
+- name: Compile restored helper modules in SHM spool after unpause
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ shm_spool_container }}"
+      - perl
+      - -I
+      - "{{ shm_pay_systems_container_dir }}/lib"
+      - -c
+      - "{{ shm_adapter_lib_container_dir }}/{{ item }}"
   changed_when: false
   loop:
-    - "{{ shm_adapter_container_path }}"
-    - "{{ shm_adapter_lib_container_dir }}/AdapterConfig.pm"
-    - "{{ shm_adapter_lib_container_dir }}/PaymentTimestamp.pm"
-    - "{{ shm_adapter_lib_container_dir }}/PaymentData.pm"
+    - AdapterConfig.pm
+    - PaymentTimestamp.pm
+    - PaymentData.pm
   when:
     - vff_fiscal_spool_paused_by_operation | default(false) | bool
     - not (adapter_restoration_failed | default(false) | bool)
