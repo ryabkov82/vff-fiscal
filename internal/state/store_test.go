@@ -855,3 +855,48 @@ func TestNotificationEventNoPointerAliasing(t *testing.T) {
 		t.Fatalf("GetNotificationEvent leaked internal pointer for DeliveredAt: got %v", again.DeliveredAt)
 	}
 }
+
+func TestTransitionReceiptConcurrentStatus(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	store, err := Open(path, AuthState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := sampleCreatingReceipt("shm:cancel-race")
+	initial.Status = "created"
+	if err := store.PutReceipt(initial); err != nil {
+		t.Fatal(err)
+	}
+
+	var wins atomic.Int32
+	var mismatches atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			updated := initial
+			updated.Status = "cancelling"
+			err := store.TransitionReceipt("shm:cancel-race", "created", updated)
+			switch {
+			case err == nil:
+				wins.Add(1)
+			case errors.Is(err, ErrReceiptStatusMismatch):
+				mismatches.Add(1)
+			default:
+				t.Errorf("unexpected transition error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if wins.Load() != 1 {
+		t.Fatalf("expected one winning transition, got %d", wins.Load())
+	}
+	if mismatches.Load() != 7 {
+		t.Fatalf("expected seven mismatches, got %d", mismatches.Load())
+	}
+	got, ok := store.GetReceipt("shm:cancel-race")
+	if !ok || got.Status != "cancelling" {
+		t.Fatalf("status = %+v ok=%v", got, ok)
+	}
+}

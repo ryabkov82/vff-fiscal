@@ -1552,11 +1552,12 @@ class TransactionRoleTests(unittest.TestCase):
         self.assertIn("adapter_files_modification_started | default(false) | bool", rescue)
         self.assertIn("Restore previous enabled state after cutover failure", rescue)
 
-    def test_restoration_validates_all_three_checksums(self) -> None:
+    def test_restoration_validates_all_helper_checksums(self) -> None:
         for name in (
             "srv_customlab_nalog.cgi",
             "lib/VFFFiscal/AdapterConfig.pm",
             "lib/VFFFiscal/PaymentTimestamp.pm",
+            "lib/VFFFiscal/PaymentData.pm",
         ):
             self.assertIn(name, self.adapter_restore)
 

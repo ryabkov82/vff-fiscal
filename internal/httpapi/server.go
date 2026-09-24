@@ -30,6 +30,7 @@ type receiptStore interface {
 	GetReceipt(externalID string) (state.ReceiptRecord, bool)
 	PutReceipt(record state.ReceiptRecord) error
 	ReserveReceipt(record state.ReceiptRecord) (state.ReceiptRecord, bool, error)
+	TransitionReceipt(externalID, expectedStatus string, updated state.ReceiptRecord) error
 	TransitionReceiptWithEvent(externalID, expectedStatus string, updated state.ReceiptRecord, event state.NotificationEvent) error
 }
 
@@ -225,6 +226,14 @@ func (s *Server) getReceipt(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, record)
 }
 
+const (
+	receiptStatusCancelling    = "cancelling"
+	receiptStatusCancelled     = "cancelled"
+	receiptStatusCancelUnknown = "cancel_unknown"
+	errCodeCancelUnknown       = "cancel_unknown"
+	errCodeCancelReconcile     = "cancel_reconciliation_required"
+)
+
 func (s *Server) cancelReceipt(w http.ResponseWriter, r *http.Request) {
 	externalID := strings.TrimSpace(r.PathValue("externalID"))
 	record, ok := s.store.GetReceipt(externalID)
@@ -232,8 +241,7 @@ func (s *Server) cancelReceipt(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "receipt not found")
 		return
 	}
-	if record.Status == "cancelled" {
-		writeJSON(w, http.StatusOK, record)
+	if done := s.respondExistingCancel(w, record); done {
 		return
 	}
 	if record.Status != "created" || record.ReceiptUUID == "" {
@@ -255,18 +263,116 @@ func (s *Server) cancelReceipt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cancelling := record
+	cancelling.Status = receiptStatusCancelling
+	cancelling.LastError = ""
+	cancelling.UpdatedAt = time.Now().UTC()
+	if err := s.store.TransitionReceipt(record.ExternalID, "created", cancelling); err != nil {
+		if errors.Is(err, state.ErrStateDurabilityUncertain) {
+			s.logger.Warn("receipt entered cancelling but state directory sync is unconfirmed",
+				"receipt_status", receiptStatusCancelling,
+			)
+		} else if errors.Is(err, state.ErrReceiptStatusMismatch) {
+			current, found := s.store.GetReceipt(externalID)
+			if found && s.respondExistingCancel(w, current) {
+				return
+			}
+			writeError(w, http.StatusConflict, "only a created receipt can be cancelled")
+			return
+		} else {
+			s.logger.Error("failed to persist receipt cancelling state",
+				"receipt_status", receiptStatusCancelling,
+				"error_code", "state_persist_failed",
+			)
+			writeError(w, http.StatusInternalServerError, "failed to persist receipt cancellation state")
+			return
+		}
+	}
+
 	if err := s.client.CancelIncome(r.Context(), record.ReceiptUUID, request.Comment, operationTime); err != nil {
-		s.writeUpstreamError(w, err)
+		s.finishCancelUpstream(w, cancelling, err)
 		return
 	}
-	record.Status = "cancelled"
-	record.UpdatedAt = time.Now().UTC()
-	record.LastError = ""
-	if err := s.store.PutReceipt(record); err != nil {
+
+	cancelled := cancelling
+	cancelled.Status = receiptStatusCancelled
+	cancelled.LastError = ""
+	cancelled.UpdatedAt = time.Now().UTC()
+	if err := s.store.TransitionReceipt(record.ExternalID, receiptStatusCancelling, cancelled); err != nil {
+		if errors.Is(err, state.ErrStateDurabilityUncertain) {
+			s.logger.Warn("receipt cancellation committed but state directory sync is unconfirmed",
+				"receipt_status", receiptStatusCancelled,
+			)
+			writeJSON(w, http.StatusOK, cancelled)
+			return
+		}
+		s.logger.Error("receipt cancelled upstream but local state update failed",
+			"receipt_status", receiptStatusCancelling,
+			"error_code", "state_persist_failed",
+		)
 		writeError(w, http.StatusInternalServerError, "receipt was cancelled but local state could not be updated")
 		return
 	}
-	writeJSON(w, http.StatusOK, record)
+	writeJSON(w, http.StatusOK, cancelled)
+}
+
+func (s *Server) respondExistingCancel(w http.ResponseWriter, record state.ReceiptRecord) bool {
+	switch record.Status {
+	case receiptStatusCancelled:
+		writeJSON(w, http.StatusOK, record)
+		return true
+	case receiptStatusCancelUnknown:
+		writeCancelReconciliation(w, errCodeCancelUnknown, record.Status)
+		return true
+	case receiptStatusCancelling:
+		writeCancelReconciliation(w, errCodeCancelReconcile, record.Status)
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) finishCancelUpstream(w http.ResponseWriter, cancelling state.ReceiptRecord, err error) {
+	outcome := classifyUpstream(err)
+	updated := cancelling
+	updated.LastError = outcome.Code
+	updated.UpdatedAt = time.Now().UTC()
+	if outcome.ReceiptStatus == receiptStatusUnknown {
+		updated.Status = receiptStatusCancelUnknown
+	} else {
+		updated.Status = "created"
+	}
+
+	txErr := s.store.TransitionReceipt(cancelling.ExternalID, receiptStatusCancelling, updated)
+	switch {
+	case txErr == nil:
+	case errors.Is(txErr, state.ErrStateDurabilityUncertain):
+		s.logger.Warn("receipt cancel outcome committed but state directory sync is unconfirmed",
+			"error_code", outcome.Code,
+			"receipt_status", updated.Status,
+		)
+	default:
+		s.logger.Error("failed to persist receipt cancel outcome",
+			"error_code", outcome.Code,
+			"receipt_status", receiptStatusCancelling,
+		)
+		writeError(w, http.StatusInternalServerError, "failed to persist receipt cancellation state")
+		return
+	}
+
+	if updated.Status == receiptStatusCancelUnknown {
+		writeCancelReconciliation(w, errCodeCancelUnknown, updated.Status)
+		return
+	}
+	s.writeUpstreamError(w, err)
+}
+
+func writeCancelReconciliation(w http.ResponseWriter, code, receiptStatus string) {
+	writeJSON(w, http.StatusConflict, map[string]any{
+		"status":         http.StatusConflict,
+		"error":          code,
+		"receipt_status": receiptStatus,
+	})
 }
 
 func (s *Server) authorize(next http.Handler) http.Handler {

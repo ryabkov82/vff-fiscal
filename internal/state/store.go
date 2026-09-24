@@ -182,6 +182,27 @@ func (s *Store) ReserveReceipt(record ReceiptRecord) (ReceiptRecord, bool, error
 	return record, true, nil
 }
 
+// TransitionReceipt atomically replaces a receipt only when its current status
+// matches expectedStatus. A mismatch leaves the stored record unchanged.
+func (s *Store) TransitionReceipt(externalID, expectedStatus string, updated ReceiptRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mutateLocked(func(candidate *fileData) error {
+		existing, ok := candidate.Receipts[externalID]
+		if !ok {
+			return ErrReceiptNotFound
+		}
+		if existing.Status != expectedStatus {
+			return ErrReceiptStatusMismatch
+		}
+		if updated.ExternalID != externalID {
+			return ErrInvalidTransitionInput
+		}
+		candidate.Receipts[externalID] = updated
+		return nil
+	})
+}
+
 func (s *Store) TransitionReceiptWithEvent(
 	externalID string,
 	expectedStatus string,

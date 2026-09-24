@@ -12,6 +12,7 @@ REQUIRED_FILES = (
     "cgi",
     "AdapterConfig.pm",
     "PaymentTimestamp.pm",
+    "PaymentData.pm",
 )
 
 
@@ -24,11 +25,13 @@ def main() -> int:
         "cgi": os.environ.get("STAGED_CGI_SHA256", ""),
         "AdapterConfig.pm": os.environ.get("STAGED_ADAPTER_CONFIG_SHA256", ""),
         "PaymentTimestamp.pm": os.environ.get("STAGED_PAYMENT_TIMESTAMP_SHA256", ""),
+        "PaymentData.pm": os.environ.get("STAGED_PAYMENT_DATA_SHA256", ""),
     }
     active = {
         "cgi": os.environ.get("ACTIVE_CGI_SHA256", ""),
         "AdapterConfig.pm": os.environ.get("ACTIVE_ADAPTER_CONFIG_SHA256", ""),
         "PaymentTimestamp.pm": os.environ.get("ACTIVE_PAYMENT_TIMESTAMP_SHA256", ""),
+        "PaymentData.pm": os.environ.get("ACTIVE_PAYMENT_DATA_SHA256", ""),
     }
 
     for name in REQUIRED_FILES:

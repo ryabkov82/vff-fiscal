@@ -648,8 +648,8 @@ func TestUserEndpointUpstreamErrorScope(t *testing.T) {
 }
 
 // TestCancelEndpointUpstreamErrorScope pins the error responses of the cancel
-// endpoint, confirms no raw upstream body escapes, and verifies the cancellation
-// state flow is unchanged (a failed cancel leaves the receipt "created").
+// endpoint and confirms no raw upstream body escapes. An ambiguous upstream
+// result moves the receipt to cancel_unknown instead of leaving it created.
 func TestCancelEndpointUpstreamErrorScope(t *testing.T) {
 	const secretBody = "FNS_RAW_BODY_SECRET inn=123456789012"
 	fake := &fakeLKNPD{}
@@ -668,20 +668,19 @@ func TestCancelEndpointUpstreamErrorScope(t *testing.T) {
 	body, _ := io.ReadAll(response.Body)
 	response.Body.Close()
 
-	if response.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 for ambiguous cancel error, got %d", response.StatusCode)
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 for ambiguous cancel error, got %d", response.StatusCode)
 	}
-	if got := errorField(t, body); got != errCodeUpstream5xx {
-		t.Fatalf("expected error code %q, got %q", errCodeUpstream5xx, got)
+	if got := errorField(t, body); got != errCodeCancelUnknown {
+		t.Fatalf("expected error code %q, got %q", errCodeCancelUnknown, got)
 	}
-	if strings.Contains(string(body), "FNS_RAW_BODY_SECRET") || strings.Contains(string(body), "123456789012") {
+	if strings.Contains(string(body), "FNS_RAW_BODY_SECRET") || strings.Contains(string(body), "123456789012") || strings.Contains(string(body), "receipt-test-1") {
 		t.Fatalf("cancel endpoint leaked upstream body: %s", body)
 	}
 
-	// Cancellation state flow is unchanged: the receipt remains created.
 	record, ok := store.GetReceipt("cancel-scope:1")
-	if !ok || record.Status != "created" {
-		t.Fatalf("failed cancel must leave receipt created, got %+v ok=%v", record, ok)
+	if !ok || record.Status != receiptStatusCancelUnknown || record.LastError != errCodeUpstream5xx {
+		t.Fatalf("ambiguous cancel must persist cancel_unknown, got %+v ok=%v", record, ok)
 	}
 }
 

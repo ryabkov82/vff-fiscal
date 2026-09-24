@@ -25,7 +25,10 @@ type fakeLKNPD struct {
 	receipt           lknpd.Receipt
 	onCreateIncome    func()
 	getUserErr        error
+	cancelIncomeCalls atomic.Int32
+	cancelIncomeGate  chan struct{}
 	cancelIncomeErr   error
+	onCancelIncome    func()
 }
 
 func (f *fakeLKNPD) GetUser(context.Context) (lknpd.UserInfo, error) {
@@ -57,6 +60,13 @@ func (f *fakeLKNPD) CreateIncome(_ context.Context, _ lknpd.CreateIncomeParams) 
 }
 
 func (f *fakeLKNPD) CancelIncome(context.Context, string, string, time.Time) error {
+	f.cancelIncomeCalls.Add(1)
+	if f.onCancelIncome != nil {
+		f.onCancelIncome()
+	}
+	if f.cancelIncomeGate != nil {
+		<-f.cancelIncomeGate
+	}
 	return f.cancelIncomeErr
 }
 

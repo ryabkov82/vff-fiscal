@@ -45,6 +45,7 @@
     - "{{ shm_adapter_path }}"
     - "{{ shm_adapter_lib_dir }}/AdapterConfig.pm"
     - "{{ shm_adapter_lib_dir }}/PaymentTimestamp.pm"
+    - "{{ shm_adapter_lib_dir }}/PaymentData.pm"
   when: not ansible_check_mode | bool
 
 - name: Read current safe adapter status
@@ -106,6 +107,7 @@
     - { src: "{{ shm_adapter_path }}", dest: srv_customlab_nalog.cgi, mode: "0700" }
     - { src: "{{ shm_adapter_lib_dir }}/AdapterConfig.pm", dest: lib/VFFFiscal/AdapterConfig.pm, mode: "0600" }
     - { src: "{{ shm_adapter_lib_dir }}/PaymentTimestamp.pm", dest: lib/VFFFiscal/PaymentTimestamp.pm, mode: "0600" }
+    - { src: "{{ shm_adapter_lib_dir }}/PaymentData.pm", dest: lib/VFFFiscal/PaymentData.pm, mode: "0600" }
   when: not ansible_check_mode | bool
 
 - name: Write pre-rollback adapter safety metadata
@@ -121,6 +123,7 @@
           'previous_cgi_sha256': adapter_rollback_current_files.results[0].stat.checksum,
           'previous_adapter_config_sha256': adapter_rollback_current_files.results[1].stat.checksum,
           'previous_payment_timestamp_sha256': adapter_rollback_current_files.results[2].stat.checksum,
+          'previous_payment_data_sha256': adapter_rollback_current_files.results[3].stat.checksum,
           'previous_enabled': adapter_rollback_current_status.enabled | default(false) | bool,
           'previous_immutable': 'immutable=1' in adapter_rollback_current_immutable.stdout_lines,
           'created_at': ansible_date_time.iso8601
@@ -140,6 +143,8 @@
       "$stage/lib/VFFFiscal/AdapterConfig.pm"
     install -m 0644 {{ (adapter_rollback_backup_dir ~ '/lib-VFFFiscal/PaymentTimestamp.pm') | quote }} \
       "$stage/lib/VFFFiscal/PaymentTimestamp.pm"
+    install -m 0644 {{ (adapter_rollback_backup_dir ~ '/lib-VFFFiscal/PaymentData.pm') | quote }} \
+      "$stage/lib/VFFFiscal/PaymentData.pm"
   args:
     executable: /bin/bash
   changed_when: true
@@ -167,6 +172,9 @@
           lib/VFFFiscal/PaymentTimestamp.pm: >-
             {{ adapter_rollback_meta.previous_payment_timestamp_sha256
             | default(adapter_rollback_meta.file_checksums['PaymentTimestamp.pm'] | default('')) }}
+          lib/VFFFiscal/PaymentData.pm: >-
+            {{ adapter_rollback_meta.previous_payment_data_sha256
+            | default(adapter_rollback_meta.file_checksums['PaymentData.pm'] | default('')) }}
 
   rescue:
     - name: Stage pre-rollback safety backup for restoration
@@ -181,6 +189,8 @@
           "$stage/lib/VFFFiscal/AdapterConfig.pm"
         install -m 0644 {{ (adapter_rollback_safety_dir ~ '/lib/VFFFiscal/PaymentTimestamp.pm') | quote }} \
           "$stage/lib/VFFFiscal/PaymentTimestamp.pm"
+        install -m 0644 {{ (adapter_rollback_safety_dir ~ '/lib/VFFFiscal/PaymentData.pm') | quote }} \
+          "$stage/lib/VFFFiscal/PaymentData.pm"
       args:
         executable: /bin/bash
       changed_when: true
@@ -199,6 +209,7 @@
           srv_customlab_nalog.cgi: "{{ adapter_rollback_current_files.results[0].stat.checksum }}"
           lib/VFFFiscal/AdapterConfig.pm: "{{ adapter_rollback_current_files.results[1].stat.checksum }}"
           lib/VFFFiscal/PaymentTimestamp.pm: "{{ adapter_rollback_current_files.results[2].stat.checksum }}"
+          lib/VFFFiscal/PaymentData.pm: "{{ adapter_rollback_current_files.results[3].stat.checksum }}"
 
     - name: Fail manual rollback after restoring pre-rollback adapter
       ansible.builtin.fail:

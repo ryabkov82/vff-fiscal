@@ -12,7 +12,7 @@ use LWP::UserAgent ();
 use HTTP::Request ();
 use SHM qw(:all);
 use VFFFiscal::AdapterConfig qw(resolve_api_token);
-use VFFFiscal::PaymentTimestamp qw(extract_operation_time);
+use VFFFiscal::PaymentData qw(extract_fiscal_payment);
 
 our %ARGS = parse_args();
 my $shm = SHM->new(skip_check_auth => 1);
@@ -90,37 +90,19 @@ sub send_receipt {
         return { status => 200, msg => 'Skipped: payment system mismatch' };
     }
 
-    my $amount;
-    if (ref($payment{comment}) eq 'HASH') {
-        my $object = $payment{comment}{object};
-        if (ref($object) eq 'HASH') {
-            my $amount_obj = $object->{amount};
-            if (ref($amount_obj) eq 'HASH' && defined $amount_obj->{value} && length $amount_obj->{value}) {
-                $amount = $amount_obj->{value};
-            }
-        }
+    my ($fiscal, $fiscal_error) = extract_fiscal_payment(\%payment);
+    if ($fiscal_error) {
+        return $fiscal_error;
     }
-    unless (defined $amount) {
-        $amount = $payment{money};
-    }
-    unless ($amount && $amount > 0) {
-        return { status => 400, msg => 'Error: payment amount is zero or negative' };
-    }
-
-    my $object =
-        ref($payment{comment}) eq 'HASH'
-            ? $payment{comment}{object}
-            : undef;
-    my ($operation_time, $timestamp_error) = extract_operation_time($object);
-    if ($timestamp_error) {
-        return $timestamp_error;
+    if ($fiscal->{skip}) {
+        return { status => 200, msg => $fiscal->{msg} };
     }
 
     my $payload = {
         external_id => "shm:$pay_id",
-        amount => sprintf('%.2f', $amount),
+        amount => $fiscal->{amount},
         service_name => $service_name,
-        operation_time => $operation_time,
+        operation_time => $fiscal->{operation_time},
     };
 
     my $request = HTTP::Request->new(POST => $backend_url);
